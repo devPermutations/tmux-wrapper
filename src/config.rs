@@ -42,6 +42,15 @@ impl Config {
             return Err("cloudflare.audience is still a placeholder — set it to your CF Access AUD tag".into());
         }
         for user in &self.users {
+            if user.unix_user.is_empty()
+                || user.unix_user == "root"
+                || !user.unix_user.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "unix_user '{}' is invalid or not allowed (must be non-root, [a-zA-Z0-9_-])",
+                    user.unix_user
+                ));
+            }
             if !user.tmux_session.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
                 return Err(format!(
                     "tmux_session '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",

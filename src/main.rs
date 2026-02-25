@@ -47,12 +47,19 @@ async fn main() {
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
+    let csp = SetResponseHeaderLayer::overriding(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' wss:; img-src 'self'",
+        ),
+    );
     let app: Router = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(sessions_handler))
         .route("/api/sessions/{name}", delete(kill_session_handler))
         .fallback_service(static_service)
         .layer(no_cache)
+        .layer(csp)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)

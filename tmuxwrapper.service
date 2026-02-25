@@ -16,8 +16,13 @@ Group=root
 # Hardening
 NoNewPrivileges=no
 ProtectSystem=strict
-ReadWritePaths=/tmp
+ReadWritePaths=/tmp /home
 PrivateTmp=false
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_FOWNER
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
 
 [Install]
 WantedBy=multi-user.target

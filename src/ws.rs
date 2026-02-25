@@ -19,6 +19,17 @@ use tracing::{error, info, warn};
 
 const MAX_SESSIONS_PER_USER: usize = 5;
 
+/// Mask email for logging: "user@example.com" → "us***@example.com"
+fn mask_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let visible = if local.len() <= 2 { local.len() } else { 2 };
+            format!("{}***@{}", &local[..visible], domain)
+        }
+        None => "***".to_string(),
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub jwks: JwksCache,
@@ -81,7 +92,7 @@ async fn authenticate(
         .find_user(&claims.email)
         .cloned()
         .ok_or_else(|| {
-            warn!(email = %claims.email, "no user mapping found");
+            warn!(email = %mask_email(&claims.email), "no user mapping found");
             StatusCode::FORBIDDEN
         })?;
 
@@ -185,16 +196,6 @@ pub async fn ws_handler(
         Err(status) => return status.into_response(),
     };
 
-    // Check session limit
-    {
-        let sessions = state.sessions.lock().await;
-        let count = sessions.get(&email).copied().unwrap_or(0);
-        if count >= MAX_SESSIONS_PER_USER {
-            warn!(email = %email, count, "session limit reached");
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
-        }
-    }
-
     // Validate requested session name if provided
     let session_name = query.session.clone();
     if let Some(ref name) = session_name {
@@ -217,9 +218,14 @@ async fn handle_socket(
     user_config: crate::config::UserConfig,
     session_name: Option<String>,
 ) {
-    // Track session
+    // Atomic check + increment session limit
     {
         let mut sessions = state.sessions.lock().await;
+        let count = sessions.get(&email).copied().unwrap_or(0);
+        if count >= MAX_SESSIONS_PER_USER {
+            warn!(user = %mask_email(&email), count, "session limit reached");
+            return;
+        }
         *sessions.entry(email.clone()).or_insert(0) += 1;
     }
 
@@ -239,7 +245,7 @@ async fn handle_socket(
     }
 
     info!(
-        email = %email,
+        user = %mask_email(&email),
         unix_user = %user_config.unix_user,
         session = %resolved.tmux_session,
         "spawning PTY"
@@ -257,7 +263,7 @@ async fn handle_socket(
 
     run_bridge(socket, pty, state.config.terminal.ping_interval_secs).await;
     decrement_session(&state, &email).await;
-    info!(email = %email, "session ended");
+    info!(user = %mask_email(&email), "session ended");
 }
 
 async fn decrement_session(state: &AppState, email: &str) {
