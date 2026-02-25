@@ -10,7 +10,7 @@ use axum::Json;
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
@@ -276,14 +276,14 @@ async fn decrement_session(state: &AppState, email: &str) {
     }
 }
 
-fn pty_resize(fd: RawFd, cols: u16, rows: u16) {
+fn pty_resize(fd: &OwnedFd, cols: u16, rows: u16) {
     let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+    unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 }
 
 enum WsInput {
@@ -293,7 +293,9 @@ enum WsInput {
 }
 
 async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u64) {
-    let pty_fd = pty.raw_fd();
+    // dup() the PTY fd for resize ioctls — owns its own fd independently
+    // so there's no use-after-close if the PtyMaster is dropped first.
+    let resize_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(pty.raw_fd()) }).ok();
     let (mut pty_read, mut pty_write) = tokio::io::split(pty);
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(64);
     let (ws_in_tx, mut ws_in_rx) = mpsc::channel::<WsInput>(64);
@@ -395,7 +397,9 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
                     }
                 }
                 WsInput::Resize(cols, rows) => {
-                    pty_resize(pty_fd, cols, rows);
+                    if let Some(ref fd) = resize_fd {
+                        pty_resize(fd, cols, rows);
+                    }
                 }
                 WsInput::Close => break,
             }
