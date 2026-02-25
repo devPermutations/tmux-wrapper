@@ -71,7 +71,11 @@
         try {
             const resp = await fetch('/api/sessions');
             if (!resp.ok) {
-                if (resp.status === 401 || resp.status === 403) {
+                if (resp.status === 401) {
+                    window.location.href = '/login.html';
+                    return null;
+                }
+                if (resp.status === 403) {
                     showOverlay('Access denied');
                     return null;
                 }

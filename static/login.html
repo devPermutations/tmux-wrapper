@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Terminal</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #000;
+            color: #fff;
+            font-family: Menlo, Monaco, "Courier New", monospace;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .login-box {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 2rem;
+            width: 320px;
+        }
+        h1 {
+            font-size: 1.2rem;
+            margin-bottom: 1.5rem;
+            text-align: center;
+            color: #ccc;
+        }
+        label {
+            display: block;
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 0.3rem;
+        }
+        input {
+            width: 100%;
+            padding: 0.6rem;
+            margin-bottom: 1rem;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 0.95rem;
+        }
+        input:focus {
+            outline: none;
+            border-color: #666;
+        }
+        button {
+            width: 100%;
+            padding: 0.7rem;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 0.95rem;
+            cursor: pointer;
+        }
+        button:hover { background: #333; }
+        button:active { background: #444; }
+        .error {
+            color: #f44;
+            font-size: 0.85rem;
+            text-align: center;
+            margin-top: 1rem;
+            min-height: 1.2em;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h1>tmuxwrapper</h1>
+        <form id="login-form">
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" autocomplete="username" autocorrect="off" autocapitalize="off" required>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" autocomplete="current-password" required>
+            <button type="submit">Log in</button>
+        </form>
+        <div class="error" id="error"></div>
+    </div>
+    <script>
+        document.getElementById('login-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var errEl = document.getElementById('error');
+            errEl.textContent = '';
+            var username = document.getElementById('username').value;
+            var password = document.getElementById('password').value;
+            try {
+                var resp = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username, password: password }),
+                });
+                if (resp.ok) {
+                    window.location.href = '/';
+                } else {
+                    errEl.textContent = 'Invalid username or password';
+                }
+            } catch (ex) {
+                errEl.textContent = 'Connection error';
+            }
+        });
+    </script>
+</body>
+</html>

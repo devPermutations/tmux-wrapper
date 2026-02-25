@@ -1,14 +1,16 @@
 mod auth;
 mod config;
+mod password_auth;
 mod pty;
 mod user;
 mod ws;
 
-use crate::auth::JwksCache;
-use crate::config::Config;
-use crate::ws::{AppState, kill_session_handler, sessions_handler, ws_handler};
+use crate::auth::{AuthProvider, JwksCache};
+use crate::config::{AuthMode, Config};
+use crate::password_auth::PasswordAuth;
+use crate::ws::{AppState, kill_session_handler, login_handler, sessions_handler, ws_handler};
 use axum::Router;
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -19,6 +21,12 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() {
+    // Handle hash-password subcommand before anything else
+    if std::env::args().nth(1).as_deref() == Some("hash-password") {
+        hash_password_cmd();
+        return;
+    }
+
     tracing_subscriber::fmt::init();
 
     let config_path = std::env::args()
@@ -27,18 +35,35 @@ async fn main() {
 
     let config = Config::load(Path::new(&config_path)).expect("failed to load config");
     let listen_addr = config.listen.clone();
+    let auth_mode = config.parsed_auth_mode().expect("invalid auth_mode");
 
-    // Set up JWKS cache and start background refresh
-    let jwks = JwksCache::new(&config.cloudflare.team_domain, &config.cloudflare.audience);
-    if let Err(e) = jwks.refresh().await {
-        tracing::warn!(error = %e, "initial JWKS fetch failed (will retry in background)");
+    // TLS warning for password mode on wildcard address
+    if auth_mode == AuthMode::Password && config.listen.starts_with("0.0.0.0") {
+        tracing::warn!(
+            "password auth on 0.0.0.0 without TLS — credentials will be sent in plaintext. \
+             Use a reverse proxy (nginx, caddy) with TLS in production."
+        );
     }
-    jwks.spawn_refresh_task(config.cloudflare.jwks_refresh_secs);
 
+    let auth = match auth_mode {
+        AuthMode::Cloudflare => {
+            let cf = config.cloudflare.as_ref().expect("cloudflare config required");
+            let jwks = JwksCache::new(&cf.team_domain, &cf.audience);
+            if let Err(e) = jwks.refresh().await {
+                tracing::warn!(error = %e, "initial JWKS fetch failed (will retry in background)");
+            }
+            jwks.spawn_refresh_task(cf.jwks_refresh_secs);
+            AuthProvider::Cloudflare(jwks)
+        }
+        AuthMode::Password => {
+            info!("password auth mode — HMAC session key generated");
+            AuthProvider::Password(PasswordAuth::new(config.terminal.session_duration_secs))
+        }
+    };
 
     let state = Arc::new(AppState {
         config,
-        jwks,
+        auth,
         sessions: Mutex::new(HashMap::new()),
     });
 
@@ -70,6 +95,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(sessions_handler))
         .route("/api/sessions/{name}", delete(kill_session_handler))
+        .route("/api/login", post(login_handler))
         .fallback_service(static_service)
         .layer(no_cache)
         .layer(csp)
@@ -87,6 +113,21 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+}
+
+fn hash_password_cmd() {
+    eprintln!("Enter password: ");
+    let mut password = String::new();
+    std::io::stdin()
+        .read_line(&mut password)
+        .expect("failed to read password");
+    let password = password.trim_end_matches('\n').trim_end_matches('\r');
+    if password.is_empty() {
+        eprintln!("Error: empty password");
+        std::process::exit(1);
+    }
+    let hash = bcrypt::hash(password, 12).expect("bcrypt hash failed");
+    println!("{hash}");
 }
 
 async fn shutdown_signal() {

@@ -1,5 +1,6 @@
-use crate::auth::JwksCache;
-use crate::config::Config;
+use crate::auth::AuthProvider;
+use crate::config::{AuthMode, Config, UserConfig};
+use crate::password_auth::PasswordAuth;
 use crate::pty::PtyMaster;
 use crate::user::ResolvedUser;
 use axum::extract::ws::{Message, WebSocket};
@@ -30,9 +31,15 @@ fn mask_email(email: &str) -> String {
     }
 }
 
+/// Mask username for logging: "ktulu" → "kt***"
+fn mask_username(username: &str) -> String {
+    let visible = if username.len() <= 2 { username.len() } else { 2 };
+    format!("{}***", &username[..visible])
+}
+
 pub struct AppState {
     pub config: Config,
-    pub jwks: JwksCache,
+    pub auth: AuthProvider,
     pub sessions: Mutex<HashMap<String, usize>>,
 }
 
@@ -56,47 +63,182 @@ pub struct TmuxSession {
     attached: bool,
 }
 
-/// Extract and verify JWT from headers, return claims + user config on success.
+/// Authenticated identity — either an email (CF) or username (password).
+struct AuthIdentity {
+    /// Key used for session counting (email or username).
+    key: String,
+    /// Display string for logs.
+    display_name: String,
+    user_config: UserConfig,
+}
+
+/// Extract and verify auth from headers, return identity on success.
 async fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<(String, crate::config::UserConfig), StatusCode> {
-    let token = headers
-        .get("Cf-Access-Jwt-Assertion")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            headers
+) -> Result<AuthIdentity, StatusCode> {
+    match &state.auth {
+        AuthProvider::Cloudflare(jwks) => {
+            let token = headers
+                .get("Cf-Access-Jwt-Assertion")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    headers
+                        .get("cookie")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|cookies| {
+                            cookies.split(';').find_map(|c| {
+                                let c = c.trim();
+                                c.strip_prefix("CF_Authorization=").map(|t| t.to_string())
+                            })
+                        })
+                })
+                .ok_or(StatusCode::UNAUTHORIZED)?;
+
+            let claims = jwks
+                .verify(&token)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "JWT verification failed");
+                    StatusCode::UNAUTHORIZED
+                })?;
+
+            let user_config = state
+                .config
+                .find_user(&claims.email)
+                .cloned()
+                .ok_or_else(|| {
+                    warn!(email = %mask_email(&claims.email), "no user mapping found");
+                    StatusCode::FORBIDDEN
+                })?;
+
+            Ok(AuthIdentity {
+                display_name: mask_email(&claims.email),
+                key: claims.email,
+                user_config,
+            })
+        }
+        AuthProvider::Password(pw_auth) => {
+            let token = headers
                 .get("cookie")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|cookies| {
                     cookies.split(';').find_map(|c| {
                         let c = c.trim();
-                        c.strip_prefix("CF_Authorization=").map(|t| t.to_string())
+                        c.strip_prefix("tmw_session=").map(|t| t.to_string())
                     })
                 })
-        })
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+                .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let claims = state
-        .jwks
-        .verify(&token)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "JWT verification failed");
-            StatusCode::UNAUTHORIZED
-        })?;
+            let username = pw_auth
+                .verify_session_token(&token)
+                .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let user_config = state
-        .config
-        .find_user(&claims.email)
-        .cloned()
-        .ok_or_else(|| {
-            warn!(email = %mask_email(&claims.email), "no user mapping found");
-            StatusCode::FORBIDDEN
-        })?;
+            let user_config = state
+                .config
+                .find_user_by_username(&username)
+                .cloned()
+                .ok_or_else(|| {
+                    warn!(user = %mask_username(&username), "no user mapping found");
+                    StatusCode::FORBIDDEN
+                })?;
 
-    Ok((claims.email, user_config))
+            Ok(AuthIdentity {
+                display_name: mask_username(&username),
+                key: username,
+                user_config,
+            })
+        }
+    }
+}
+
+/// POST /api/login — password auth login
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+pub async fn login_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    let pw_auth = match &state.auth {
+        AuthProvider::Password(pw) => pw,
+        AuthProvider::Cloudflare(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // Origin check — reject cross-origin login attempts
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let origin_host = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .unwrap_or(origin)
+            .split(':')
+            .next()
+            .unwrap_or("");
+        let host_name = host.split(':').next().unwrap_or("");
+        if origin_host != host_name {
+            warn!(origin = %origin, "rejected login: origin mismatch");
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
+    let user = match state.config.find_user_by_username(&body.username) {
+        Some(u) => u.clone(),
+        None => {
+            warn!(user = %mask_username(&body.username), "login: unknown user");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+
+    let hash = match &user.password_hash {
+        Some(h) => h.clone(),
+        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let password = body.password.clone();
+    let valid = match tokio::task::spawn_blocking(move || {
+        PasswordAuth::verify_password(&hash, &password)
+    })
+    .await
+    {
+        Ok(Ok(true)) => true,
+        Ok(Ok(false)) => {
+            warn!(user = %mask_username(&body.username), "login: wrong password");
+            false
+        }
+        Ok(Err(e)) => {
+            error!(error = %e, "bcrypt error");
+            false
+        }
+        Err(e) => {
+            error!(error = %e, "spawn_blocking failed");
+            false
+        }
+    };
+
+    if !valid {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let token = pw_auth.create_session_token(&body.username);
+    let max_age = pw_auth.session_duration_secs();
+    info!(user = %mask_username(&body.username), "login successful");
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            "Set-Cookie",
+            format!("tmw_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age}"),
+        )
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(r#"{"ok":true}"#))
+        .unwrap()
+        .into_response()
 }
 
 /// GET /api/sessions — list tmux sessions for the authenticated user
@@ -104,7 +246,7 @@ pub async fn sessions_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let (_email, user_config) = match authenticate(&state, &headers).await {
+    let identity = match authenticate(&state, &headers).await {
         Ok(v) => v,
         Err(status) => return status.into_response(),
     };
@@ -113,7 +255,7 @@ pub async fn sessions_handler(
     let output = tokio::process::Command::new("/usr/bin/sudo")
         .args([
             "-u",
-            &user_config.unix_user,
+            &identity.user_config.unix_user,
             "/usr/bin/tmux",
             "list-sessions",
             "-F",
@@ -153,7 +295,7 @@ pub async fn kill_session_handler(
     headers: HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let (_email, user_config) = match authenticate(&state, &headers).await {
+    let identity = match authenticate(&state, &headers).await {
         Ok(v) => v,
         Err(status) => return status.into_response(),
     };
@@ -164,18 +306,18 @@ pub async fn kill_session_handler(
     }
 
     let output = tokio::process::Command::new("/usr/bin/sudo")
-        .args(["-u", &user_config.unix_user, "/usr/bin/tmux", "kill-session", "-t", &name])
+        .args(["-u", &identity.user_config.unix_user, "/usr/bin/tmux", "kill-session", "-t", &name])
         .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
-            info!(user = %user_config.unix_user, session = %name, "killed tmux session");
+            info!(user = %identity.user_config.unix_user, session = %name, "killed tmux session");
             StatusCode::OK.into_response()
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            warn!(user = %user_config.unix_user, session = %name, error = %stderr, "kill-session failed");
+            warn!(user = %identity.user_config.unix_user, session = %name, error = %stderr, "kill-session failed");
             StatusCode::NOT_FOUND.into_response()
         }
         Err(e) => {
@@ -191,17 +333,28 @@ pub async fn ws_handler(
     headers: HeaderMap,
     Query(query): Query<WsQuery>,
 ) -> Response {
-    // Validate Origin to prevent Cross-Site WebSocket Hijacking (CSWSH).
-    // CF Access uses SameSite=None cookies, so cross-origin WS would carry valid auth.
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-        if !origin.ends_with(host) {
-            warn!(origin = %origin, host = %host, "rejected WebSocket: origin mismatch");
-            return StatusCode::FORBIDDEN.into_response();
+    // Origin check for CF mode (SameSite=None cookies need server-side CSRF protection).
+    // Password mode uses SameSite=Strict cookies, which handles CSRF.
+    if matches!(state.config.parsed_auth_mode(), Ok(AuthMode::Cloudflare)) {
+        if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+            let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+            // Extract hostname only (strip scheme and port) for exact comparison
+            let origin_host = origin
+                .strip_prefix("https://")
+                .or_else(|| origin.strip_prefix("http://"))
+                .unwrap_or(origin)
+                .split(':')
+                .next()
+                .unwrap_or("");
+            let host_name = host.split(':').next().unwrap_or("");
+            if origin_host != host_name {
+                warn!(origin = %origin, host = %host, "rejected WebSocket: origin mismatch");
+                return StatusCode::FORBIDDEN.into_response();
+            }
         }
     }
 
-    let (email, user_config) = match authenticate(&state, &headers).await {
+    let identity = match authenticate(&state, &headers).await {
         Ok(v) => v,
         Err(status) => return status.into_response(),
     };
@@ -216,7 +369,7 @@ pub async fn ws_handler(
 
     let state_clone = Arc::clone(&state);
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, state_clone, email, user_config, session_name)
+        handle_socket(socket, state_clone, identity.key, identity.display_name, identity.user_config, session_name)
     })
     .into_response()
 }
@@ -224,19 +377,20 @@ pub async fn ws_handler(
 async fn handle_socket(
     socket: WebSocket,
     state: Arc<AppState>,
-    email: String,
-    user_config: crate::config::UserConfig,
+    session_key: String,
+    display_name: String,
+    user_config: UserConfig,
     session_name: Option<String>,
 ) {
     // Atomic check + increment session limit
     {
         let mut sessions = state.sessions.lock().await;
-        let count = sessions.get(&email).copied().unwrap_or(0);
+        let count = sessions.get(&session_key).copied().unwrap_or(0);
         if count >= MAX_SESSIONS_PER_USER {
-            warn!(user = %mask_email(&email), count, "session limit reached");
+            warn!(user = %display_name, count, "session limit reached");
             return;
         }
-        *sessions.entry(email.clone()).or_insert(0) += 1;
+        *sessions.entry(session_key.clone()).or_insert(0) += 1;
     }
 
     // Resolve unix user
@@ -244,7 +398,7 @@ async fn handle_socket(
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "user resolution failed");
-            decrement_session(&state, &email).await;
+            decrement_session(&state, &session_key).await;
             return;
         }
     };
@@ -255,7 +409,7 @@ async fn handle_socket(
     }
 
     info!(
-        user = %mask_email(&email),
+        user = %display_name,
         unix_user = %user_config.unix_user,
         session = %resolved.tmux_session,
         "spawning PTY"
@@ -266,24 +420,23 @@ async fn handle_socket(
         Ok(p) => p,
         Err(e) => {
             error!(error = %e, "PTY spawn failed");
-            decrement_session(&state, &email).await;
+            decrement_session(&state, &session_key).await;
             return;
         }
     };
 
-    let masked = mask_email(&email);
     let session_label = resolved.tmux_session.clone();
-    run_bridge(socket, pty, state.config.terminal.ping_interval_secs, &masked, &session_label).await;
-    decrement_session(&state, &email).await;
-    info!(user = %mask_email(&email), "session ended");
+    run_bridge(socket, pty, state.config.terminal.ping_interval_secs, &display_name, &session_label).await;
+    decrement_session(&state, &session_key).await;
+    info!(user = %display_name, "session ended");
 }
 
-async fn decrement_session(state: &AppState, email: &str) {
+async fn decrement_session(state: &AppState, key: &str) {
     let mut sessions = state.sessions.lock().await;
-    if let Some(count) = sessions.get_mut(email) {
+    if let Some(count) = sessions.get_mut(key) {
         *count = count.saturating_sub(1);
         if *count == 0 {
-            sessions.remove(email);
+            sessions.remove(key);
         }
     }
 }
