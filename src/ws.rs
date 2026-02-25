@@ -110,11 +110,11 @@ pub async fn sessions_handler(
     };
 
     // Run `tmux list-sessions` as the target user
-    let output = tokio::process::Command::new("sudo")
+    let output = tokio::process::Command::new("/usr/bin/sudo")
         .args([
             "-u",
             &user_config.unix_user,
-            "tmux",
+            "/usr/bin/tmux",
             "list-sessions",
             "-F",
             "#{session_name}\t#{session_windows}\t#{session_attached}",
@@ -163,8 +163,8 @@ pub async fn kill_session_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let output = tokio::process::Command::new("sudo")
-        .args(["-u", &user_config.unix_user, "tmux", "kill-session", "-t", &name])
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .args(["-u", &user_config.unix_user, "/usr/bin/tmux", "kill-session", "-t", &name])
         .output()
         .await;
 
