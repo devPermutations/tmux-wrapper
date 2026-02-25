@@ -78,6 +78,12 @@ impl Config {
             AuthMode::Cloudflare => {
                 let cf = self.cloudflare.as_ref()
                     .ok_or("auth_mode is 'cloudflare' but [cloudflare] section is missing")?;
+                if !cf.team_domain.chars().all(|c| c.is_alphanumeric() || c == '-') {
+                    return Err(format!(
+                        "cloudflare.team_domain '{}' contains invalid characters (only [a-zA-Z0-9-] allowed)",
+                        cf.team_domain
+                    ));
+                }
                 if cf.audience.contains("REPLACE") {
                     return Err("cloudflare.audience is still a placeholder — set it to your CF Access AUD tag".into());
                 }

@@ -4,18 +4,19 @@ use crate::password_auth::PasswordAuth;
 use crate::pty::PtyMaster;
 use crate::user::ResolvedUser;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, Instant, interval};
 use tracing::{error, info, warn};
 
 const MAX_SESSIONS_PER_USER: usize = 5;
@@ -37,10 +38,58 @@ fn mask_username(username: &str) -> String {
     format!("{}***", &username[..visible])
 }
 
+/// Per-IP login attempt tracker for brute-force protection.
+pub struct LoginRateLimiter {
+    /// Maps IP → (failure count, window start).
+    attempts: Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>,
+}
+
+const MAX_LOGIN_ATTEMPTS: u32 = 5;
+const LOGIN_WINDOW_SECS: u64 = 60;
+
+impl LoginRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns true if the IP is rate-limited (too many failures).
+    async fn is_limited(&self, ip: std::net::IpAddr) -> bool {
+        let mut map = self.attempts.lock().await;
+        if let Some((count, start)) = map.get(&ip) {
+            if start.elapsed().as_secs() >= LOGIN_WINDOW_SECS {
+                map.remove(&ip);
+                return false;
+            }
+            *count >= MAX_LOGIN_ATTEMPTS
+        } else {
+            false
+        }
+    }
+
+    /// Record a failed login attempt for an IP.
+    async fn record_failure(&self, ip: std::net::IpAddr) {
+        let mut map = self.attempts.lock().await;
+        let entry = map.entry(ip).or_insert((0, Instant::now()));
+        if entry.1.elapsed().as_secs() >= LOGIN_WINDOW_SECS {
+            *entry = (1, Instant::now());
+        } else {
+            entry.0 += 1;
+        }
+    }
+
+    /// Clear failures for an IP after successful login.
+    async fn clear(&self, ip: std::net::IpAddr) {
+        self.attempts.lock().await.remove(&ip);
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub auth: AuthProvider,
     pub sessions: Mutex<HashMap<String, usize>>,
+    pub login_limiter: LoginRateLimiter,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +211,7 @@ pub struct LoginRequest {
 
 pub async fn login_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
@@ -169,6 +219,13 @@ pub async fn login_handler(
         AuthProvider::Password(pw) => pw,
         AuthProvider::Cloudflare(_) => return StatusCode::NOT_FOUND.into_response(),
     };
+
+    // Rate limit — 5 failed attempts per IP per minute
+    let client_ip = addr.ip();
+    if state.login_limiter.is_limited(client_ip).await {
+        warn!(ip = %client_ip, "login rate-limited");
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
 
     // Origin check — reject cross-origin login attempts
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
@@ -191,6 +248,7 @@ pub async fn login_handler(
         Some(u) => u.clone(),
         None => {
             warn!(user = %mask_username(&body.username), "login: unknown user");
+            state.login_limiter.record_failure(client_ip).await;
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -222,9 +280,11 @@ pub async fn login_handler(
     };
 
     if !valid {
+        state.login_limiter.record_failure(client_ip).await;
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    state.login_limiter.clear(client_ip).await;
     let token = pw_auth.create_session_token(&body.username);
     let max_age = pw_auth.session_duration_secs();
     info!(user = %mask_username(&body.username), "login successful");

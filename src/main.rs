@@ -8,7 +8,7 @@ mod ws;
 use crate::auth::{AuthProvider, JwksCache};
 use crate::config::{AuthMode, Config};
 use crate::password_auth::PasswordAuth;
-use crate::ws::{AppState, kill_session_handler, login_handler, sessions_handler, ws_handler};
+use crate::ws::{AppState, LoginRateLimiter, kill_session_handler, login_handler, sessions_handler, ws_handler};
 use axum::Router;
 use axum::routing::{delete, get, post};
 use std::collections::HashMap;
@@ -65,6 +65,7 @@ async fn main() {
         config,
         auth,
         sessions: Mutex::new(HashMap::new()),
+        login_limiter: LoginRateLimiter::new(),
     });
 
     let static_dir = state.config.static_dir.clone();
@@ -109,7 +110,7 @@ async fn main() {
         .expect("failed to bind");
 
     info!(addr = %listen_addr, "listening");
-    axum::serve(listener, app.into_make_service())
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
