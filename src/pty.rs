@@ -126,6 +126,8 @@ impl PtyMaster {
                     CString::new("-A").unwrap(),
                     CString::new("-s").unwrap(),
                     CString::new(session).unwrap(),
+                    CString::new("-c").unwrap(),
+                    CString::new(home.clone()).unwrap(),
                 ];
                 let arg_refs: Vec<&std::ffi::CStr> = args.iter().map(|a| a.as_c_str()).collect();
                 nix::unistd::execvp(&tmux, &arg_refs).ok();
