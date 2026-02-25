@@ -402,12 +402,15 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
         }
     });
 
-    // Wait for any task to finish
+    // Wait for any task to finish, then abort the others
     tokio::select! {
         _ = &mut ws_task => {}
         _ = &mut pty_to_ws => {}
         _ = &mut ws_to_pty => {}
     }
 
+    ws_task.abort();
+    pty_to_ws.abort();
+    ws_to_pty.abort();
     drop(ws_out_tx);
 }

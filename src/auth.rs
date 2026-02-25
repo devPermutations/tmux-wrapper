@@ -71,10 +71,10 @@ impl JwksCache {
         let cache = self.clone();
         tokio::spawn(async move {
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
                 if let Err(e) = cache.refresh().await {
                     warn!("JWKS refresh failed: {e}");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             }
         });
     }
