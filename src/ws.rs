@@ -191,6 +191,16 @@ pub async fn ws_handler(
     headers: HeaderMap,
     Query(query): Query<WsQuery>,
 ) -> Response {
+    // Validate Origin to prevent Cross-Site WebSocket Hijacking (CSWSH).
+    // CF Access uses SameSite=None cookies, so cross-origin WS would carry valid auth.
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !origin.ends_with(host) {
+            warn!(origin = %origin, host = %host, "rejected WebSocket: origin mismatch");
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     let (email, user_config) = match authenticate(&state, &headers).await {
         Ok(v) => v,
         Err(status) => return status.into_response(),

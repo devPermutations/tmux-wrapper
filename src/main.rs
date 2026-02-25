@@ -51,8 +51,20 @@ async fn main() {
     let csp = SetResponseHeaderLayer::overriding(
         axum::http::header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' wss:; img-src 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' wss:; img-src 'self'; frame-ancestors 'none'",
         ),
+    );
+    let nosniff = SetResponseHeaderLayer::overriding(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    let referrer = SetResponseHeaderLayer::overriding(
+        axum::http::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    let permissions = SetResponseHeaderLayer::overriding(
+        axum::http::HeaderName::from_static("permissions-policy"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
     let app: Router = Router::new()
         .route("/ws", get(ws_handler))
@@ -61,6 +73,9 @@ async fn main() {
         .fallback_service(static_service)
         .layer(no_cache)
         .layer(csp)
+        .layer(nosniff)
+        .layer(referrer)
+        .layer(permissions)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
