@@ -105,14 +105,8 @@ pub async fn sessions_handler(
     headers: HeaderMap,
 ) -> Response {
     let (_email, user_config) = match authenticate(&state, &headers).await {
-        Ok(v) => {
-            info!(user = %v.1.unix_user, "sessions_handler: auth OK");
-            v
-        }
-        Err(status) => {
-            warn!(status = %status, "sessions_handler: auth failed");
-            return status.into_response();
-        }
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
     };
 
     // Run `tmux list-sessions` as the target user
@@ -131,13 +125,6 @@ pub async fn sessions_handler(
     let sessions: Vec<TmuxSession> = match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout_s = stdout.trim().to_string();
-            let stderr_s = stderr.trim().to_string();
-            info!(
-                "tmux list-sessions: exit={} stdout_len={} stderr_len={} stdout={:?} stderr={:?}",
-                out.status, stdout_s.len(), stderr_s.len(), stdout_s, stderr_s
-            );
             stdout
                 .lines()
                 .filter_map(|line| {
@@ -274,7 +261,9 @@ async fn handle_socket(
         }
     };
 
-    run_bridge(socket, pty, state.config.terminal.ping_interval_secs).await;
+    let masked = mask_email(&email);
+    let session_label = resolved.tmux_session.clone();
+    run_bridge(socket, pty, state.config.terminal.ping_interval_secs, &masked, &session_label).await;
     decrement_session(&state, &email).await;
     info!(user = %mask_email(&email), "session ended");
 }
@@ -305,15 +294,19 @@ enum WsInput {
     Close,
 }
 
-async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u64) {
+async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u64, user: &str, session: &str) {
+    let user = user.to_string();
+    let session = session.to_string();
     // dup() the PTY fd for resize ioctls — owns its own fd independently
     // so there's no use-after-close if the PtyMaster is dropped first.
     let resize_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(pty.raw_fd()) }).ok();
     let (mut pty_read, mut pty_write) = tokio::io::split(pty);
-    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(64);
-    let (ws_in_tx, mut ws_in_rx) = mpsc::channel::<WsInput>(64);
+    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(16);
+    let (ws_in_tx, mut ws_in_rx) = mpsc::channel::<WsInput>(16);
 
     // Task 1: WebSocket I/O loop — owns the socket
+    let user1 = user.clone();
+    let session1 = session.clone();
     let mut ws_task = tokio::spawn(async move {
         let mut ping_ticker = interval(Duration::from_secs(ping_interval_secs));
         loop {
@@ -352,7 +345,7 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
                             break;
                         }
                         Some(Err(e)) => {
-                            warn!(error = %e, "WebSocket recv error");
+                            warn!(user = %user1, session = %session1, error = %e, "WebSocket recv error");
                             break;
                         }
                         _ => {}
@@ -373,6 +366,8 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
     });
 
     // Task 2: PTY → WebSocket
+    let user2 = user.clone();
+    let session2 = session.clone();
     let ws_out_tx_clone = ws_out_tx.clone();
     let mut pty_to_ws = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
@@ -392,7 +387,7 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "PTY read error");
+                    warn!(user = %user2, session = %session2, error = %e, "PTY read error");
                     break;
                 }
             }
@@ -405,7 +400,7 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
             match input {
                 WsInput::Data(data) => {
                     if let Err(e) = pty_write.write_all(&data).await {
-                        warn!(error = %e, "PTY write error");
+                        warn!(user = %user, session = %session, error = %e, "PTY write error");
                         break;
                     }
                 }

@@ -83,4 +83,12 @@ async fn shutdown_signal() {
         _ = ctrl_c => { info!("received SIGINT, shutting down"); }
         _ = sigterm.recv() => { info!("received SIGTERM, shutting down"); }
     }
+
+    // Force exit after grace period — WebSocket sessions are long-lived
+    // and won't close on their own during graceful shutdown.
+    tokio::spawn(async {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        info!("graceful shutdown timeout, forcing exit");
+        std::process::exit(0);
+    });
 }

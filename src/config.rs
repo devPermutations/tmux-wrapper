@@ -38,6 +38,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.listen.parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid listen address '{}': {}", self.listen, e))?;
+        if !Path::new(&self.static_dir).is_dir() {
+            return Err(format!("static_dir '{}' does not exist or is not a directory", self.static_dir));
+        }
         if self.cloudflare.audience.contains("REPLACE") {
             return Err("cloudflare.audience is still a placeholder — set it to your CF Access AUD tag".into());
         }

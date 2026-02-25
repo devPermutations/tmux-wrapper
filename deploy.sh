@@ -8,7 +8,7 @@ echo "==> Creating $DEST"
 sudo mkdir -p "$DEST/static/vendor"
 
 echo "==> Copying binary"
-sudo cp "$SRC/target/release/tmuxwrapper-docker" "$DEST/tmuxwrapper"
+sudo cp "$SRC/target/release/tmuxwrapper" "$DEST/tmuxwrapper"
 sudo chmod +x "$DEST/tmuxwrapper"
 
 echo "==> Copying config"
