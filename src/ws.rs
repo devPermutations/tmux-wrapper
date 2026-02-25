@@ -105,8 +105,14 @@ pub async fn sessions_handler(
     headers: HeaderMap,
 ) -> Response {
     let (_email, user_config) = match authenticate(&state, &headers).await {
-        Ok(v) => v,
-        Err(status) => return status.into_response(),
+        Ok(v) => {
+            info!(user = %v.1.unix_user, "sessions_handler: auth OK");
+            v
+        }
+        Err(status) => {
+            warn!(status = %status, "sessions_handler: auth failed");
+            return status.into_response();
+        }
     };
 
     // Run `tmux list-sessions` as the target user
@@ -125,6 +131,13 @@ pub async fn sessions_handler(
     let sessions: Vec<TmuxSession> = match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout_s = stdout.trim().to_string();
+            let stderr_s = stderr.trim().to_string();
+            info!(
+                "tmux list-sessions: exit={} stdout_len={} stderr_len={} stdout={:?} stderr={:?}",
+                out.status, stdout_s.len(), stderr_s.len(), stdout_s, stderr_s
+            );
             stdout
                 .lines()
                 .filter_map(|line| {

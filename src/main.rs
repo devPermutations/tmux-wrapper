@@ -35,8 +35,6 @@ async fn main() {
     }
     jwks.spawn_refresh_task(config.cloudflare.jwks_refresh_secs);
 
-    // Reap zombie child processes (forked PTY children)
-    spawn_child_reaper();
 
     let state = Arc::new(AppState {
         config,
@@ -74,25 +72,6 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
-}
-
-fn spawn_child_reaper() {
-    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-        .expect("failed to install SIGCHLD handler");
-    tokio::spawn(async move {
-        loop {
-            sigchld.recv().await;
-            loop {
-                match nix::sys::wait::waitpid(
-                    nix::unistd::Pid::from_raw(-1),
-                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                ) {
-                    Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(_) => break,
-                    Ok(_) => continue,
-                }
-            }
-        }
-    });
 }
 
 async fn shutdown_signal() {
