@@ -106,20 +106,28 @@ impl PtyMaster {
                     unsafe { libc::_exit(126) };
                 }
 
-                // Set environment (safe: we're in a forked child, single-threaded)
+                // Set environment using libc directly — Rust's std::env functions
+                // acquire internal locks that may be deadlocked after fork()
+                // in a multi-threaded (tokio) process.
                 unsafe {
-                    std::env::set_var("HOME", &home);
-                    std::env::set_var("USER", &username);
-                    std::env::set_var("SHELL", &shell);
-                    std::env::set_var("TERM", "xterm-256color");
-                    std::env::remove_var("TMUX");
+                    let home_c = CString::new(home.as_str()).unwrap_or_default();
+                    let user_c = CString::new(username.as_str()).unwrap_or_default();
+                    let shell_c = CString::new(shell.as_str()).unwrap_or_default();
+                    libc::setenv(b"HOME\0".as_ptr().cast(), home_c.as_ptr(), 1);
+                    libc::setenv(b"USER\0".as_ptr().cast(), user_c.as_ptr(), 1);
+                    libc::setenv(b"SHELL\0".as_ptr().cast(), shell_c.as_ptr(), 1);
+                    libc::setenv(b"TERM\0".as_ptr().cast(), b"xterm-256color\0".as_ptr().cast(), 1);
+                    libc::unsetenv(b"TMUX\0".as_ptr().cast());
                 }
 
-                // chdir to home
-                std::env::set_current_dir(&home).ok();
+                // chdir using libc — same reason as above
+                unsafe {
+                    let home_c = CString::new(home.as_str()).unwrap_or_default();
+                    libc::chdir(home_c.as_ptr());
+                }
 
                 // Exec tmux
-                let tmux = CString::new("tmux").unwrap();
+                let tmux = CString::new("/usr/bin/tmux").unwrap();
                 let args = [
                     CString::new("tmux").unwrap(),
                     CString::new("new-session").unwrap(),
