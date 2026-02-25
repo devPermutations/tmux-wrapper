@@ -11,7 +11,7 @@
     <link rel="apple-touch-icon" href="/icon-192.png">
     <title>Terminal</title>
     <link rel="stylesheet" href="/vendor/xterm.css">
-    <link rel="stylesheet" href="/terminal.css?v=5">
+    <link rel="stylesheet" href="/terminal.css?v=6">
 </head>
 <body>
     <div id="terminal"></div>
@@ -38,12 +38,21 @@
             </div>
         </div>
     </div>
+    <div id="confirm-dialog" class="hidden">
+        <div id="confirm-inner">
+            <p id="confirm-msg"></p>
+            <div id="confirm-buttons">
+                <button id="confirm-no">Cancel</button>
+                <button id="confirm-yes">Kill</button>
+            </div>
+        </div>
+    </div>
     <div id="overlay" class="hidden">
         <span id="overlay-text">Reconnecting...</span>
     </div>
     <script src="/vendor/xterm.js"></script>
     <script src="/vendor/addon-fit.js"></script>
     <script src="/vendor/addon-web-links.js"></script>
-    <script src="/terminal.js?v=5"></script>
+    <script src="/terminal.js?v=6"></script>
 </body>
 </html>

@@ -6,9 +6,9 @@ mod ws;
 
 use crate::auth::JwksCache;
 use crate::config::Config;
-use crate::ws::{AppState, sessions_handler, ws_handler};
+use crate::ws::{AppState, kill_session_handler, sessions_handler, ws_handler};
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{delete, get};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -50,6 +50,7 @@ async fn main() {
     let app: Router = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/sessions", get(sessions_handler))
+        .route("/api/sessions/{name}", delete(kill_session_handler))
         .fallback_service(static_service)
         .layer(no_cache)
         .with_state(state);

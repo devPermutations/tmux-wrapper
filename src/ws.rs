@@ -136,6 +136,44 @@ pub async fn sessions_handler(
     Json(sessions).into_response()
 }
 
+/// DELETE /api/sessions/:name — kill a tmux session
+pub async fn kill_session_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let (_email, user_config) = match authenticate(&state, &headers).await {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
+
+    // Validate session name
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let output = tokio::process::Command::new("sudo")
+        .args(["-u", &user_config.unix_user, "tmux", "kill-session", "-t", &name])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            info!(user = %user_config.unix_user, session = %name, "killed tmux session");
+            StatusCode::OK.into_response()
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            warn!(user = %user_config.unix_user, session = %name, error = %stderr, "kill-session failed");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "failed to run tmux kill-session");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,

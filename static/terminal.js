@@ -108,7 +108,10 @@
             sessionList.innerHTML = '<div class="session-empty">No tmux sessions found</div>';
         } else {
             sessions.forEach(function (s) {
-                const btn = document.createElement('button');
+                var row = document.createElement('div');
+                row.className = 'session-row';
+
+                var btn = document.createElement('button');
                 btn.className = 'session-btn';
                 btn.innerHTML =
                     '<span class="session-name">' + escapeHtml(s.name) + '</span>' +
@@ -117,9 +120,62 @@
                 btn.addEventListener('click', function () {
                     connectToSession(s.name);
                 });
-                sessionList.appendChild(btn);
+
+                var killBtn = document.createElement('button');
+                killBtn.className = 'session-kill-btn';
+                killBtn.textContent = '\u00D7';
+                killBtn.title = 'Kill session';
+                killBtn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    confirmKillSession(s.name);
+                });
+
+                row.appendChild(btn);
+                row.appendChild(killBtn);
+                sessionList.appendChild(row);
             });
         }
+    }
+
+    function confirmKillSession(name) {
+        var dialog = document.getElementById('confirm-dialog');
+        var msg = document.getElementById('confirm-msg');
+        var yesBtn = document.getElementById('confirm-yes');
+        var noBtn = document.getElementById('confirm-no');
+
+        msg.textContent = 'Kill session "' + name + '"?';
+        dialog.classList.remove('hidden');
+
+        function cleanup() {
+            dialog.classList.add('hidden');
+            yesBtn.removeEventListener('click', onYes);
+            noBtn.removeEventListener('click', onNo);
+        }
+        function onYes() {
+            cleanup();
+            killSession(name);
+        }
+        function onNo() {
+            cleanup();
+        }
+        yesBtn.addEventListener('click', onYes);
+        noBtn.addEventListener('click', onNo);
+    }
+
+    async function killSession(name) {
+        try {
+            var resp = await fetch('/api/sessions/' + encodeURIComponent(name), {
+                method: 'DELETE',
+            });
+            if (!resp.ok) {
+                showOverlay('Failed to kill session');
+                setTimeout(hideOverlay, 2000);
+            }
+        } catch (e) {
+            showOverlay('Failed to kill session');
+            setTimeout(hideOverlay, 2000);
+        }
+        loadSessionPicker();
     }
 
     function escapeHtml(str) {
