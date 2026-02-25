@@ -1,0 +1,239 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    /* iOS safe areas */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+
+#terminal {
+    width: 100%;
+    height: 100%;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+}
+
+/* Key bar - only shown on touch devices */
+#key-bar {
+    display: none;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    background: #1a1a1a;
+    border-top: 1px solid #333;
+    padding: 4px 2px;
+    padding-bottom: calc(4px + env(safe-area-inset-bottom));
+    gap: 3px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+#key-bar button {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 4px;
+    background: #2a2a2a;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 5px;
+    font-size: 13px;
+    font-family: -apple-system, BlinkMacSystemFont, monospace;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    cursor: pointer;
+}
+
+#key-bar button:active {
+    background: #444;
+}
+
+#btn-sessions {
+    background: #1a1a2e;
+    border-color: #335;
+    flex: 0 0 auto;
+    padding: 10px 10px;
+}
+
+#key-bar button.active {
+    background: #0066cc;
+    color: #fff;
+    border-color: #0088ff;
+}
+
+/* Show key bar on touch devices only */
+@media (hover: none) and (pointer: coarse) {
+    #key-bar {
+        display: flex;
+    }
+    #terminal {
+        bottom: 0; /* Adjusted dynamically by JS */
+    }
+}
+
+/* Overlay for reconnecting state */
+#overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+}
+
+#overlay.hidden {
+    display: none;
+}
+
+#overlay-text {
+    font-size: 18px;
+    color: #aaa;
+}
+
+/* Session picker */
+#session-picker {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 300;
+}
+
+#session-picker.hidden {
+    display: none;
+}
+
+#session-picker-inner {
+    width: 90%;
+    max-width: 400px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+}
+
+#session-picker-inner h2 {
+    font-size: 18px;
+    font-weight: 500;
+    color: #888;
+    margin-bottom: 16px;
+    text-align: center;
+}
+
+#session-list {
+    overflow-y: auto;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+}
+
+.session-btn {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 16px;
+    background: #111;
+    border: 1px solid #333;
+    border-radius: 8px;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.1s;
+}
+
+.session-btn:hover {
+    background: #1a1a1a;
+    border-color: #555;
+}
+
+.session-btn:active {
+    background: #222;
+}
+
+.session-name {
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    font-weight: 600;
+}
+
+.session-info {
+    font-size: 12px;
+    color: #666;
+}
+
+.session-loading, .session-empty {
+    text-align: center;
+    color: #666;
+    padding: 20px;
+}
+
+#new-session {
+    display: flex;
+    gap: 8px;
+}
+
+#new-session-name {
+    flex: 1;
+    padding: 12px 14px;
+    background: #111;
+    border: 1px solid #333;
+    border-radius: 8px;
+    color: #fff;
+    font-size: 15px;
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    outline: none;
+}
+
+#new-session-name:focus {
+    border-color: #555;
+}
+
+#new-session-btn {
+    padding: 12px 20px;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 8px;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+}
+
+#new-session-btn:hover {
+    background: #222;
+    border-color: #555;
+}
+
+/* Override xterm.js to fill container */
+.xterm {
+    height: 100%;
+}
+
+.xterm-viewport {
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+}

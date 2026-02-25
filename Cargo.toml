@@ -1,0 +1,21 @@
+[package]
+name = "tmuxwrapper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+nix = { version = "0.31", features = ["fs", "process", "signal", "term", "user"] }
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+strip = true
+lto = true

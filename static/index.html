@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Terminal">
+    <meta name="theme-color" content="#000000">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <title>Terminal</title>
+    <link rel="stylesheet" href="/vendor/xterm.css">
+    <link rel="stylesheet" href="/terminal.css?v=5">
+</head>
+<body>
+    <div id="terminal"></div>
+    <div id="key-bar">
+        <button data-key="sessions" id="btn-sessions">&#9776;</button>
+        <button data-key="Escape">Esc</button>
+        <button data-key="ctrl" id="btn-ctrl">Ctrl</button>
+        <button data-key="Tab">Tab</button>
+        <button data-key="|">|</button>
+        <button data-key="~">~</button>
+        <button data-key="-">-</button>
+        <button data-key="ArrowUp">&uarr;</button>
+        <button data-key="ArrowDown">&darr;</button>
+        <button data-key="ArrowLeft">&larr;</button>
+        <button data-key="ArrowRight">&rarr;</button>
+    </div>
+    <div id="session-picker" class="hidden">
+        <div id="session-picker-inner">
+            <h2>tmux sessions</h2>
+            <div id="session-list"></div>
+            <div id="new-session">
+                <input type="text" id="new-session-name" placeholder="New session name" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button id="new-session-btn">Create</button>
+            </div>
+        </div>
+    </div>
+    <div id="overlay" class="hidden">
+        <span id="overlay-text">Reconnecting...</span>
+    </div>
+    <script src="/vendor/xterm.js"></script>
+    <script src="/vendor/addon-fit.js"></script>
+    <script src="/vendor/addon-web-links.js"></script>
+    <script src="/terminal.js?v=5"></script>
+</body>
+</html>

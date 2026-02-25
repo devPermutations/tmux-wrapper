@@ -1,0 +1,23 @@
+[Unit]
+Description=tmuxwrapper — web terminal
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/tmuxwrapper/tmuxwrapper /opt/tmuxwrapper/config.toml
+WorkingDirectory=/opt/tmuxwrapper
+Restart=on-failure
+RestartSec=3
+
+# Needs root to setuid/setgid into target users
+User=root
+Group=root
+
+# Hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ReadWritePaths=/tmp
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target
