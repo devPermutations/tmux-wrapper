@@ -3,13 +3,41 @@
 
     const TAG_DATA = 0x00;
     const TAG_CONTROL = 0x01;
+    const TAG_AUDIO = 0x02;
+    const TAG_TTS_CTRL = 0x03;
 
     // --- State ---
     let ws = null;
     let currentSession = null;
     let reconnectDelay = 1000;
     let ctrlActive = false;
+    let ttsEnabled = false;
     const MAX_RECONNECT_DELAY = 30000;
+
+    // --- TTS audio playback queue ---
+    var audioQueue = [];
+    var audioPlaying = false;
+    var currentAudio = null;
+
+    function playNextAudio() {
+        if (audioQueue.length === 0) { audioPlaying = false; currentAudio = null; return; }
+        audioPlaying = true;
+        var blob = new Blob([audioQueue.shift()], { type: 'audio/ogg' });
+        currentAudio = new Audio(URL.createObjectURL(blob));
+        currentAudio.onended = function () { URL.revokeObjectURL(currentAudio.src); playNextAudio(); };
+        currentAudio.onerror = function () { URL.revokeObjectURL(currentAudio.src); playNextAudio(); };
+        currentAudio.play().catch(function () { playNextAudio(); });
+    }
+
+    function stopAllAudio() {
+        audioQueue = [];
+        audioPlaying = false;
+        if (currentAudio) {
+            currentAudio.pause();
+            URL.revokeObjectURL(currentAudio.src);
+            currentAudio = null;
+        }
+    }
 
     // --- Terminal setup ---
     const term = new Terminal({
@@ -211,7 +239,12 @@
     }
 
     function switchSession() {
-        // Disconnect current session and show picker
+        // Stop TTS and disconnect
+        if (ttsEnabled) {
+            ttsEnabled = false;
+            document.getElementById('btn-tts').classList.remove('active');
+        }
+        stopAllAudio();
         if (ws) {
             ws.onclose = null;
             ws.onerror = null;
@@ -292,10 +325,14 @@
             if (data.length < 1) return;
             if (data[0] === TAG_DATA) {
                 term.write(data.slice(1));
+            } else if (data[0] === TAG_AUDIO) {
+                audioQueue.push(data.slice(1));
+                if (!audioPlaying) playNextAudio();
             }
         };
 
         ws.onclose = function (event) {
+            stopAllAudio();
             if (event.code === 4001 || event.code === 4003) {
                 showOverlay('Access denied');
                 return;
@@ -382,6 +419,23 @@
             return;
         }
 
+        if (key === 'tts') {
+            ttsEnabled = !ttsEnabled;
+            document.getElementById('btn-tts').classList.toggle('active', ttsEnabled);
+            if (!ttsEnabled) {
+                stopAllAudio();
+            }
+            var ctrl = new TextEncoder().encode(JSON.stringify({ enabled: ttsEnabled }));
+            var frame = new Uint8Array(1 + ctrl.length);
+            frame[0] = TAG_TTS_CTRL;
+            frame.set(ctrl, 1);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(frame.buffer);
+            }
+            term.focus();
+            return;
+        }
+
         if (key === 'ctrl') {
             ctrlActive = !ctrlActive;
             btnCtrl.classList.toggle('active', ctrlActive);
@@ -424,6 +478,58 @@
             sendData(new TextEncoder().encode(seq));
         }
     }
+
+    // --- Mobile touch scrolling ---
+    // xterm.js renders a canvas (.xterm-screen) on top of the scrollable
+    // .xterm-viewport div. Touch events hit the canvas and never reach the
+    // scroll container. We dispatch synthetic wheel events so xterm.js handles
+    // both normal scrollback AND alternate-screen apps (vim, claude, less, etc.)
+    (function () {
+        var screen = container.querySelector('.xterm-screen');
+        if (!screen) return;
+
+        var touchStartY = 0;
+        var touchStartX = 0;
+        var scrolling = false;
+        var SCROLL_THRESHOLD = 10;
+        var LINE_HEIGHT = 20; // approx pixels per scroll line
+
+        container.addEventListener('touchstart', function (e) {
+            if (e.touches.length !== 1) return;
+            touchStartY = e.touches[0].clientY;
+            touchStartX = e.touches[0].clientX;
+            scrolling = false;
+        }, { passive: true });
+
+        container.addEventListener('touchmove', function (e) {
+            if (e.touches.length !== 1) return;
+            var dy = touchStartY - e.touches[0].clientY;
+            var dx = touchStartX - e.touches[0].clientX;
+
+            if (!scrolling) {
+                if (Math.abs(dy) > SCROLL_THRESHOLD && Math.abs(dy) > Math.abs(dx)) {
+                    scrolling = true;
+                } else {
+                    return;
+                }
+            }
+
+            // Dispatch a synthetic wheel event on the xterm screen element.
+            // xterm.js listens for wheel events and handles scrolling for both
+            // the normal buffer (scrollback) and alternate buffer (mouse apps).
+            screen.dispatchEvent(new WheelEvent('wheel', {
+                deltaY: dy,
+                deltaX: 0,
+                deltaMode: 0, // DOM_DELTA_PIXEL
+                bubbles: true,
+                cancelable: true,
+            }));
+
+            touchStartY = e.touches[0].clientY;
+            touchStartX = e.touches[0].clientX;
+            e.preventDefault();
+        }, { passive: false });
+    })();
 
     // Keep terminal focused
     document.addEventListener('click', function (e) {

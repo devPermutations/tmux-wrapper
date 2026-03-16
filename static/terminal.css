@@ -70,6 +70,18 @@ html, body {
     padding: 10px 10px;
 }
 
+#btn-tts {
+    background: #1a2e1a;
+    border-color: #353;
+    flex: 0 0 auto;
+    padding: 10px 10px;
+}
+
+#btn-tts.active {
+    background: #1a6e1a;
+    border-color: #3a3;
+}
+
 #key-bar button.active {
     background: #0066cc;
     color: #fff;

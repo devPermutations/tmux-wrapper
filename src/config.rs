@@ -11,14 +11,20 @@ fn default_auth_mode() -> String {
     "cloudflare".to_string()
 }
 
+fn default_listen() -> String {
+    "127.0.0.1:7681".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_listen")]
     pub listen: String,
     pub static_dir: String,
     #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
     pub cloudflare: Option<CloudflareConfig>,
     pub terminal: TerminalConfig,
+    pub tts: Option<TtsConfig>,
     pub users: Vec<UserConfig>,
 }
 
@@ -38,6 +44,28 @@ pub struct TerminalConfig {
     pub ping_interval_secs: u64,
     #[serde(default = "default_session_duration_secs")]
     pub session_duration_secs: u64,
+}
+
+fn default_piper_binary() -> String {
+    "/opt/piper/piper".to_string()
+}
+
+fn default_voices_dir() -> String {
+    "/opt/piper/voices".to_string()
+}
+
+fn default_voice() -> String {
+    "en_US-lessac-medium".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TtsConfig {
+    #[serde(default = "default_piper_binary")]
+    pub piper_binary: String,
+    #[serde(default = "default_voices_dir")]
+    pub voices_dir: String,
+    #[serde(default = "default_voice")]
+    pub default_voice: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

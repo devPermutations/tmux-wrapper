@@ -1,4 +1,4 @@
-listen = "0.0.0.0:7681"
+listen = "127.0.0.1:7681"
 static_dir = "./static"
 
 [cloudflare]
@@ -8,6 +8,11 @@ jwks_refresh_secs = 3600
 
 [terminal]
 ping_interval_secs = 30
+
+[tts]
+piper_binary = "/opt/piper/piper"
+voices_dir = "/opt/piper/voices"
+default_voice = "en_US-joe-medium"
 
 [[users]]
 email = "you@example.com"

@@ -71,10 +71,14 @@ impl JwksCache {
     pub fn spawn_refresh_task(&self, interval_secs: u64) {
         let cache = self.clone();
         tokio::spawn(async move {
+            let mut retry_secs = interval_secs;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
                 if let Err(e) = cache.refresh().await {
                     warn!("JWKS refresh failed: {e}");
+                    retry_secs = 30; // retry quickly on failure
+                } else {
+                    retry_secs = interval_secs;
                 }
             }
         });

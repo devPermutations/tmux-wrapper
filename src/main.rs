@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod password_auth;
 mod pty;
+mod tts;
 mod user;
 mod ws;
 
@@ -77,7 +78,7 @@ async fn main() {
     let csp = SetResponseHeaderLayer::overriding(
         axum::http::header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss:; img-src 'self'; frame-ancestors 'none'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss:; img-src 'self'; media-src 'self' blob:; frame-ancestors 'none'",
         ),
     );
     let nosniff = SetResponseHeaderLayer::overriding(
