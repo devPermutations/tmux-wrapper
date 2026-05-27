@@ -4,6 +4,12 @@ Single-binary web tmux terminal, fronted by Cloudflare Access.
 
 The auth is the tunnel. The binary just runs tmux.
 
+<p align="center">
+  <img src="screenshots/main.jpg" width="240" alt="Session picker">
+  <img src="screenshots/root.jpg" width="240" alt="Terminal session">
+  <img src="screenshots/claude.jpg" width="240" alt="Claude Code on mobile">
+</p>
+
 ```
 browser ─► permutations cloudflare ─► your host (127.0.0.1:7681) ─► tmuxwrapper ─► tmux
             ↑                              ↑
