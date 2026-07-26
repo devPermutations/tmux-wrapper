@@ -1,7 +1,6 @@
 mod auth;
 mod config;
 mod pty;
-mod tts;
 mod user;
 mod ws;
 

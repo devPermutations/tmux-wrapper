@@ -1,7 +1,6 @@
 use crate::auth::JwksCache;
-use crate::config::{Config, TtsConfig, UserConfig};
+use crate::config::{Config, UserConfig};
 use crate::pty::PtyMaster;
-use crate::tts::{PiperSynthesizer, split_sentences};
 use crate::user::ResolvedUser;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket};
@@ -13,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval};
@@ -309,16 +307,12 @@ async fn handle_socket(
     };
 
     let session_label = resolved.tmux_session.clone();
-    let tts_config = state.config.tts.clone();
-    let unix_user = user_config.unix_user.clone();
     run_bridge(
         socket,
         pty,
         state.config.terminal.ping_interval_secs,
         &display_name,
         &session_label,
-        tts_config,
-        &unix_user,
     )
     .await;
     decrement_session(&state, &session_key).await;
@@ -345,15 +339,12 @@ fn pty_resize(fd: &OwnedFd, cols: u16, rows: u16) {
     unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 }
 
-#[derive(Debug, Deserialize)]
-struct TtsControl {
-    enabled: bool,
-}
-
+// Binary WebSocket protocol:
+//   0x00 — raw terminal data (both directions)
+//   0x01 — JSON control message, client → server (currently only resize)
 enum WsInput {
     Data(Vec<u8>),
     Resize(u16, u16),
-    TtsToggle(bool),
     Close,
 }
 
@@ -363,8 +354,6 @@ async fn run_bridge(
     ping_interval_secs: u64,
     user: &str,
     session: &str,
-    tts_config: Option<TtsConfig>,
-    unix_user: &str,
 ) {
     let user = user.to_string();
     let session = session.to_string();
@@ -374,10 +363,6 @@ async fn run_bridge(
     let (mut pty_read, mut pty_write) = tokio::io::split(pty);
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(16);
     let (ws_in_tx, mut ws_in_rx) = mpsc::channel::<WsInput>(16);
-
-    // TTS state — shared between tasks
-    let tts_enabled = Arc::new(AtomicBool::new(false));
-    let tts_file = format!("/tmp/tmuxwrapper-tts-{}-{}", unix_user, session);
 
     // Task 1: WebSocket I/O loop — owns the socket
     let user1 = user.clone();
@@ -405,13 +390,6 @@ async fn run_bridge(
                                         } else {
                                             continue;
                                         }
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                0x03 => {
-                                    if let Ok(ctrl) = serde_json::from_slice::<TtsControl>(&data[1..]) {
-                                        WsInput::TtsToggle(ctrl.enabled)
                                     } else {
                                         continue;
                                     }
@@ -477,7 +455,6 @@ async fn run_bridge(
     });
 
     // Task 3: WebSocket → PTY
-    let tts_enabled_clone = Arc::clone(&tts_enabled);
     let mut ws_to_pty = tokio::spawn(async move {
         while let Some(input) = ws_in_rx.recv().await {
             match input {
@@ -492,62 +469,7 @@ async fn run_bridge(
                         pty_resize(fd, cols, rows);
                     }
                 }
-                WsInput::TtsToggle(enabled) => {
-                    tts_enabled_clone.store(enabled, Ordering::Relaxed);
-                    info!(tts = enabled, "TTS toggled");
-                }
                 WsInput::Close => break,
-            }
-        }
-    });
-
-    // Task 4: TTS file watcher — polls for response text written by Claude Code's Stop hook
-    let ws_out_tx_tts = ws_out_tx.clone();
-    let tts_enabled_clone2 = Arc::clone(&tts_enabled);
-    let mut tts_task = tokio::spawn(async move {
-        let synthesizer = match tts_config {
-            Some(ref cfg) => {
-                PiperSynthesizer::new(&cfg.piper_binary, &cfg.voices_dir, &cfg.default_voice)
-            }
-            None => return,
-        };
-
-        loop {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-
-            if !tts_enabled_clone2.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            // Check if the hook wrote a response file
-            let text = match tokio::fs::read_to_string(&tts_file).await {
-                Ok(t) if !t.trim().is_empty() => {
-                    // Remove the file immediately so we don't re-process it
-                    let _ = tokio::fs::remove_file(&tts_file).await;
-                    t
-                }
-                _ => continue,
-            };
-
-            // Split into sentences and synthesize each
-            let sentences = split_sentences(&text);
-            for sentence in sentences {
-                // Check if TTS was disabled while we're synthesizing
-                if !tts_enabled_clone2.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Some(audio) = synthesizer.speak(sentence).await {
-                    let mut frame = Vec::with_capacity(1 + audio.len());
-                    frame.push(0x02);
-                    frame.extend_from_slice(&audio);
-                    if ws_out_tx_tts
-                        .send(Message::Binary(frame.into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
             }
         }
     });
@@ -557,12 +479,10 @@ async fn run_bridge(
         _ = &mut ws_task => {}
         _ = &mut pty_to_ws => {}
         _ = &mut ws_to_pty => {}
-        _ = &mut tts_task => {}
     }
 
     ws_task.abort();
     pty_to_ws.abort();
     ws_to_pty.abort();
-    tts_task.abort();
     drop(ws_out_tx);
 }

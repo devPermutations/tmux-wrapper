@@ -12,7 +12,6 @@ pub struct Config {
     pub static_dir: String,
     pub cloudflare: CloudflareConfig,
     pub terminal: TerminalConfig,
-    pub tts: Option<TtsConfig>,
     pub users: Vec<UserConfig>,
 }
 
@@ -26,28 +25,6 @@ pub struct CloudflareConfig {
 #[derive(Debug, Deserialize)]
 pub struct TerminalConfig {
     pub ping_interval_secs: u64,
-}
-
-fn default_piper_binary() -> String {
-    "/opt/piper/piper".to_string()
-}
-
-fn default_voices_dir() -> String {
-    "/opt/piper/voices".to_string()
-}
-
-fn default_voice() -> String {
-    "en_US-lessac-medium".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TtsConfig {
-    #[serde(default = "default_piper_binary")]
-    pub piper_binary: String,
-    #[serde(default = "default_voices_dir")]
-    pub voices_dir: String,
-    #[serde(default = "default_voice")]
-    pub default_voice: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
