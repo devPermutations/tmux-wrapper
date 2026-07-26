@@ -3,7 +3,7 @@ use crate::config::{Config, UserConfig};
 use crate::pty::PtyMaster;
 use crate::user::ResolvedUser;
 use axum::Json;
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -17,7 +17,20 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
-const MAX_SESSIONS_PER_USER: usize = 5;
+/// Cap on simultaneous WebSocket connections per user (a browser tab each).
+/// Distinct from the tmux-session cap, which is configurable via
+/// `[terminal] max_sessions_per_user`.
+const MAX_CONCURRENT_CONNECTIONS_PER_USER: usize = 5;
+
+/// Close code used when a connection or session limit refuses the socket.
+/// The reason text is surfaced verbatim by the frontend.
+const CLOSE_CODE_LIMIT: u16 = 4004;
+
+/// Session names may only contain [a-zA-Z0-9_-].
+fn is_valid_session_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
 
 /// Mask email for logging: "user@example.com" → "us***@example.com"
 fn mask_email(email: &str) -> String {
@@ -162,10 +175,7 @@ pub async fn kill_session_handler(
     };
 
     // Validate session name
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-    {
+    if !is_valid_session_name(&name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -233,10 +243,7 @@ pub async fn ws_handler(
     // Validate requested session name if provided
     let session_name = query.session.clone();
     if let Some(ref name) = session_name {
-        if !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-        {
+        if !is_valid_session_name(name) {
             return StatusCode::BAD_REQUEST.into_response();
         }
     }
@@ -255,6 +262,39 @@ pub async fn ws_handler(
     .into_response()
 }
 
+/// Refuse a freshly upgraded socket with a close frame the frontend surfaces.
+async fn refuse_socket(mut socket: WebSocket, reason: &str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: CLOSE_CODE_LIMIT,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+/// Names of the user's existing tmux sessions.
+/// Empty when the user's tmux server isn't running.
+async fn list_session_names(unix_user: &str) -> Vec<String> {
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .args([
+            "-u",
+            unix_user,
+            "/usr/bin/tmux",
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -263,12 +303,17 @@ async fn handle_socket(
     user_config: UserConfig,
     session_name: Option<String>,
 ) {
-    // Atomic check + increment session limit
+    // Atomic check + increment of the per-user WebSocket connection count
     {
         let mut sessions = state.sessions.lock().await;
         let count = sessions.get(&session_key).copied().unwrap_or(0);
-        if count >= MAX_SESSIONS_PER_USER {
-            warn!(user = %display_name, count, "session limit reached");
+        if count >= MAX_CONCURRENT_CONNECTIONS_PER_USER {
+            warn!(user = %display_name, count, "connection limit reached");
+            refuse_socket(
+                socket,
+                "connection limit reached — close another terminal tab first",
+            )
+            .await;
             return;
         }
         *sessions.entry(session_key.clone()).or_insert(0) += 1;
@@ -287,6 +332,23 @@ async fn handle_socket(
     // Override session name if provided in query
     if let Some(name) = session_name {
         resolved.tmux_session = name;
+    }
+
+    // Real tmux-session cap: spawning a NEW session name is refused past the
+    // limit; attaching to an existing session is always allowed.
+    let existing = list_session_names(&user_config.unix_user).await;
+    if !existing.iter().any(|s| *s == resolved.tmux_session)
+        && existing.len() >= state.config.terminal.max_sessions_per_user
+    {
+        warn!(
+            user = %display_name,
+            session = %resolved.tmux_session,
+            existing = existing.len(),
+            "tmux session limit reached"
+        );
+        refuse_socket(socket, "session limit reached — kill an old session first").await;
+        decrement_session(&state, &session_key).await;
+        return;
     }
 
     info!(

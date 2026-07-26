@@ -22,9 +22,17 @@ pub struct CloudflareConfig {
     pub jwks_refresh_secs: u64,
 }
 
+fn default_max_sessions_per_user() -> usize {
+    5
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TerminalConfig {
     pub ping_interval_secs: u64,
+    /// Cap on distinct tmux sessions per user. Creating a new session past
+    /// the cap is refused; attaching to an existing one is always allowed.
+    #[serde(default = "default_max_sessions_per_user")]
+    pub max_sessions_per_user: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

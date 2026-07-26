@@ -301,6 +301,17 @@
                 showOverlay('Access denied');
                 return;
             }
+            if (event.code === 4004) {
+                // Server refused: connection or session limit reached.
+                // Show the reason, then return to the picker so the user
+                // can kill an old session.
+                showOverlay(event.reason || 'Limit reached');
+                setTimeout(function () {
+                    hideOverlay();
+                    switchSession();
+                }, 3000);
+                return;
+            }
             scheduleReconnect();
         };
 

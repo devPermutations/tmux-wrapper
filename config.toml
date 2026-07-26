@@ -8,6 +8,7 @@ jwks_refresh_secs = 3600
 
 [terminal]
 ping_interval_secs = 30
+max_sessions_per_user = 5
 
 [[users]]
 email = "you@example.com"
