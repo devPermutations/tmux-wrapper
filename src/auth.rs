@@ -30,6 +30,16 @@ pub struct Claims {
     pub exp: u64,
 }
 
+/// Retry delay after the `n`th consecutive failed JWKS fetch
+/// (0-indexed): 5s, 10s, 20s, 40s, then capped at 60s.
+pub(crate) fn backoff_secs(failure_count: u32) -> u64 {
+    const BASE_SECS: u64 = 5;
+    const CAP_SECS: u64 = 60;
+    BASE_SECS
+        .saturating_mul(1u64 << failure_count.min(63))
+        .min(CAP_SECS)
+}
+
 #[derive(Clone)]
 pub struct JwksCache {
     keys: Arc<RwLock<Vec<DecodingKey>>>,
@@ -67,17 +77,39 @@ impl JwksCache {
         Ok(())
     }
 
+    async fn has_keys(&self) -> bool {
+        !self.keys.read().await.is_empty()
+    }
+
+    /// Spawn the background JWKS refresh loop.
+    ///
+    /// If the caller's initial fetch failed (no keys cached yet), the loop
+    /// starts in backoff mode instead of waiting a full `interval_secs` —
+    /// otherwise a failed cold start would 401 every request until the first
+    /// scheduled refresh. Any later failed refresh also drops into backoff
+    /// (5s, 10s, 20s, ... capped at 60s) until a fetch succeeds, then the
+    /// normal `interval_secs` cadence resumes.
     pub fn spawn_refresh_task(&self, interval_secs: u64) {
         let cache = self.clone();
         tokio::spawn(async move {
-            let mut retry_secs = interval_secs;
+            let mut failures: u32 = if cache.has_keys().await { 0 } else { 1 };
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
-                if let Err(e) = cache.refresh().await {
-                    warn!("JWKS refresh failed: {e}");
-                    retry_secs = 30; // retry quickly on failure
+                let sleep_secs = if failures == 0 {
+                    interval_secs
                 } else {
-                    retry_secs = interval_secs;
+                    backoff_secs(failures - 1)
+                };
+                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                match cache.refresh().await {
+                    Ok(()) => failures = 0,
+                    Err(e) => {
+                        failures = failures.saturating_add(1);
+                        warn!(
+                            error = %e,
+                            retry_in_secs = backoff_secs(failures - 1),
+                            "JWKS refresh failed"
+                        );
+                    }
                 }
             }
         });
