@@ -78,12 +78,10 @@ impl PiperSynthesizer {
         let piper_binary = self.piper_binary.clone();
         let model_path = self.model_path.clone();
 
-        tokio::task::spawn_blocking(move || {
-            Self::speak_blocking(&piper_binary, &model_path, &text)
-        })
-        .await
-        .ok()
-        .flatten()
+        tokio::task::spawn_blocking(move || Self::speak_blocking(&piper_binary, &model_path, &text))
+            .await
+            .ok()
+            .flatten()
     }
 
     fn speak_blocking(piper_binary: &str, model_path: &str, text: &str) -> Option<Vec<u8>> {
@@ -107,14 +105,22 @@ impl PiperSynthesizer {
 
         let ffmpeg = StdCommand::new("/usr/bin/ffmpeg")
             .args([
-                "-f", "s16le",
-                "-ar", "22050",
-                "-ac", "1",
-                "-i", "pipe:0",
-                "-c:a", "libopus",
-                "-b:a", "24k",
-                "-application", "voip",
-                "-f", "ogg",
+                "-f",
+                "s16le",
+                "-ar",
+                "22050",
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "24k",
+                "-application",
+                "voip",
+                "-f",
+                "ogg",
                 "pipe:1",
             ])
             .stdin(piper_stdout)
@@ -145,7 +151,8 @@ mod tests {
 
     #[test]
     fn test_split_sentences_basic() {
-        let text = "This is a longer first sentence. This is a second sentence that is also long enough.";
+        let text =
+            "This is a longer first sentence. This is a second sentence that is also long enough.";
         let sentences = split_sentences(text);
         assert!(sentences.len() >= 2);
     }

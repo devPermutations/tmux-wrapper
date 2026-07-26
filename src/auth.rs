@@ -1,5 +1,4 @@
-use crate::password_auth::PasswordAuth;
-use jsonwebtoken::{DecodingKey, Validation, decode, Algorithm};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -105,10 +104,4 @@ impl JwksCache {
             Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into())
         }
     }
-}
-
-#[derive(Clone)]
-pub enum AuthProvider {
-    Cloudflare(JwksCache),
-    Password(PasswordAuth),
 }

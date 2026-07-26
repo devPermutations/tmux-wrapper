@@ -100,7 +100,9 @@
             const resp = await fetch('/api/sessions');
             if (!resp.ok) {
                 if (resp.status === 401) {
-                    window.location.href = '/login.html';
+                    // Cloudflare Access token missing/expired — a full reload
+                    // bounces through CF Access and re-authenticates.
+                    showOverlay('Session expired — reload the page');
                     return null;
                 }
                 if (resp.status === 403) {

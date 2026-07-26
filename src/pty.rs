@@ -2,7 +2,7 @@ use crate::user::ResolvedUser;
 use nix::libc;
 use nix::pty::openpty;
 use nix::sys::signal;
-use nix::unistd::{setsid, ForkResult, Pid, Uid, fork};
+use nix::unistd::{ForkResult, Pid, Uid, fork, setsid};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -42,8 +42,8 @@ impl PtyMaster {
                 let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
                 unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) };
 
-                let async_fd = AsyncFd::new(master_fd)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let async_fd =
+                    AsyncFd::new(master_fd).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
                 Ok(PtyMaster {
                     async_fd,
@@ -116,7 +116,11 @@ impl PtyMaster {
                     libc::setenv(b"HOME\0".as_ptr().cast(), home_c.as_ptr(), 1);
                     libc::setenv(b"USER\0".as_ptr().cast(), user_c.as_ptr(), 1);
                     libc::setenv(b"SHELL\0".as_ptr().cast(), shell_c.as_ptr(), 1);
-                    libc::setenv(b"TERM\0".as_ptr().cast(), b"xterm-256color\0".as_ptr().cast(), 1);
+                    libc::setenv(
+                        b"TERM\0".as_ptr().cast(),
+                        b"xterm-256color\0".as_ptr().cast(),
+                        1,
+                    );
                     libc::unsetenv(b"TMUX\0".as_ptr().cast());
                 }
 
@@ -154,10 +158,7 @@ impl PtyMaster {
 impl Drop for PtyMaster {
     fn drop(&mut self) {
         let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGHUP);
-        let _ = nix::sys::wait::waitpid(
-            self.child_pid,
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-        );
+        let _ = nix::sys::wait::waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
     }
 }
 
@@ -177,7 +178,11 @@ impl AsyncRead for PtyMaster {
             let fd = self.async_fd.get_ref().as_raw_fd();
             let unfilled = buf.initialize_unfilled();
             let n = unsafe {
-                libc::read(fd, unfilled.as_mut_ptr() as *mut libc::c_void, unfilled.len())
+                libc::read(
+                    fd,
+                    unfilled.as_mut_ptr() as *mut libc::c_void,
+                    unfilled.len(),
+                )
             };
 
             if n > 0 {
@@ -211,9 +216,7 @@ impl AsyncWrite for PtyMaster {
             };
 
             let fd = self.async_fd.get_ref().as_raw_fd();
-            let n = unsafe {
-                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
 
             if n >= 0 {
                 return Poll::Ready(Ok(n as usize));
