@@ -242,10 +242,10 @@ pub async fn ws_handler(
 
     // Validate requested session name if provided
     let session_name = query.session.clone();
-    if let Some(ref name) = session_name {
-        if !is_valid_session_name(name) {
-            return StatusCode::BAD_REQUEST.into_response();
-        }
+    if let Some(ref name) = session_name
+        && !is_valid_session_name(name)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let state_clone = Arc::clone(&state);
@@ -337,7 +337,7 @@ async fn handle_socket(
     // Real tmux-session cap: spawning a NEW session name is refused past the
     // limit; attaching to an existing session is always allowed.
     let existing = list_session_names(&user_config.unix_user).await;
-    if !existing.iter().any(|s| *s == resolved.tmux_session)
+    if !existing.contains(&resolved.tmux_session)
         && existing.len() >= state.config.terminal.max_sessions_per_user
     {
         warn!(
@@ -547,4 +547,33 @@ async fn run_bridge(
     pty_to_ws.abort();
     ws_to_pty.abort();
     drop(ws_out_tx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_session_name, mask_email};
+
+    #[test]
+    fn session_names_allow_alphanumeric_underscore_dash() {
+        assert!(is_valid_session_name("main"));
+        assert!(is_valid_session_name("my-session_2"));
+        assert!(is_valid_session_name("A1"));
+    }
+
+    #[test]
+    fn session_names_reject_shell_and_path_metacharacters() {
+        assert!(!is_valid_session_name("main session"));
+        assert!(!is_valid_session_name("../etc"));
+        assert!(!is_valid_session_name("a;rm -rf"));
+        assert!(!is_valid_session_name("a|b"));
+        assert!(!is_valid_session_name("a$b"));
+        assert!(!is_valid_session_name("a.b"));
+    }
+
+    #[test]
+    fn mask_email_hides_local_part() {
+        assert_eq!(mask_email("user@example.com"), "us***@example.com");
+        assert_eq!(mask_email("ab@example.com"), "ab***@example.com");
+        assert_eq!(mask_email("not-an-email"), "***");
+    }
 }

@@ -23,6 +23,7 @@ struct JwkKey {
 #[derive(Debug, Deserialize)]
 pub struct Claims {
     pub email: String,
+    #[allow(dead_code)]
     pub sub: String,
     #[allow(dead_code)]
     pub aud: serde_json::Value,
@@ -135,5 +136,23 @@ impl JwksCache {
         } else {
             Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backoff_secs;
+
+    #[test]
+    fn backoff_doubles_from_five_seconds_and_caps_at_sixty() {
+        let schedule: Vec<u64> = (0..6).map(backoff_secs).collect();
+        assert_eq!(schedule, vec![5, 10, 20, 40, 60, 60]);
+    }
+
+    #[test]
+    fn backoff_never_overflows_on_long_outages() {
+        assert_eq!(backoff_secs(u32::MAX), 60);
+        assert_eq!(backoff_secs(63), 60);
+        assert_eq!(backoff_secs(64), 60);
     }
 }
