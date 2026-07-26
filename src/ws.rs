@@ -274,6 +274,11 @@ async fn refuse_socket(mut socket: WebSocket, reason: &str) {
 
 /// Names of the user's existing tmux sessions.
 /// Empty when the user's tmux server isn't running.
+///
+/// Fails open (returns empty) on any error so a broken listing can't lock
+/// users out, but warns unless the failure is the legitimate "no sessions"
+/// case — otherwise e.g. a sudo misconfiguration would silently disable the
+/// session cap (PTY spawn doesn't go through sudo, so sessions still spawn).
 async fn list_session_names(unix_user: &str) -> Vec<String> {
     let output = tokio::process::Command::new("/usr/bin/sudo")
         .args([
@@ -291,7 +296,28 @@ async fn list_session_names(unix_user: &str) -> Vec<String> {
             .lines()
             .map(str::to_string)
             .collect(),
-        _ => Vec::new(),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // tmux exits non-zero with these when the user simply has no
+            // running server — not worth a warning.
+            if !stderr.contains("no server running") && !stderr.contains("error connecting") {
+                warn!(
+                    unix_user = %unix_user,
+                    status = %out.status,
+                    stderr = %stderr.trim(),
+                    "tmux list-sessions failed — session cap not enforced for this connection"
+                );
+            }
+            Vec::new()
+        }
+        Err(e) => {
+            warn!(
+                unix_user = %unix_user,
+                error = %e,
+                "failed to run tmux list-sessions — session cap not enforced for this connection"
+            );
+            Vec::new()
+        }
     }
 }
 

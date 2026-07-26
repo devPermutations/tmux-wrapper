@@ -2,6 +2,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -54,7 +55,13 @@ impl JwksCache {
     pub fn new(team_domain: &str, audience: &str) -> Self {
         Self {
             keys: Arc::new(RwLock::new(Vec::new())),
-            client: Client::new(),
+            // Explicit timeouts: a hung fetch would otherwise stall the
+            // backoff/refresh loop forever (reqwest has no default timeout).
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build JWKS HTTP client"),
             jwks_url: format!("https://{team_domain}.cloudflareaccess.com/cdn-cgi/access/certs"),
             audience: audience.to_string(),
             issuer: format!("https://{team_domain}.cloudflareaccess.com"),
@@ -71,6 +78,18 @@ impl JwksCache {
                 Ok(dk) => decoding_keys.push(dk),
                 Err(e) => warn!("skipping invalid JWK: {e}"),
             }
+        }
+
+        // A fetch that yields zero usable keys is a failure, not a success:
+        // returning Ok would reset the backoff and leave an empty keyset
+        // (401ing every request) for a full jwks_refresh_secs.
+        if decoding_keys.is_empty() {
+            return Err(format!(
+                "JWKS fetch from {} yielded no usable keys ({} JWKs in response)",
+                self.jwks_url,
+                resp.keys.len()
+            )
+            .into());
         }
 
         info!(count = decoding_keys.len(), "cached JWKS keys");
