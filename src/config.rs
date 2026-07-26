@@ -69,7 +69,7 @@ impl Config {
         if !cf
             .team_domain
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             return Err(format!(
                 "cloudflare.team_domain '{}' contains invalid characters (only [a-zA-Z0-9-] allowed)",
@@ -95,7 +95,7 @@ impl Config {
                 || !user
                     .unix_user
                     .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Err(format!(
                     "unix_user '{}' is invalid or not allowed (must be non-root, [a-zA-Z0-9_-])",
@@ -105,7 +105,7 @@ impl Config {
             if !user
                 .tmux_session
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Err(format!(
                     "tmux_session '{}' contains invalid characters (only [a-zA-Z0-9_-] allowed)",
@@ -237,6 +237,14 @@ tmux_session = "main"
     fn unix_user_shell_metacharacters_rejected() {
         let toml = VALID.replace("alice", "alice;rm");
         assert!(Config::from_toml_str(&toml).is_err());
+    }
+
+    #[test]
+    fn non_ascii_unix_user_rejected() {
+        // is_alphanumeric() would accept "josé"; the contract is [A-Za-z0-9_-].
+        let toml = VALID.replace("alice", "josé");
+        let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert!(err.contains("unix_user"), "got: {err}");
     }
 
     #[test]

@@ -29,7 +29,14 @@ const CLOSE_CODE_LIMIT: u16 = 4004;
 /// Session names may only contain [a-zA-Z0-9_-].
 fn is_valid_session_name(name: &str) -> bool {
     name.chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Tmux-session cap decision: refuse only when the requested name is NEW and
+/// the user is already at the cap. Attaching to an existing session is always
+/// allowed regardless of the cap.
+fn refuses_new_session(existing: &[String], requested: &str, cap: usize) -> bool {
+    !existing.iter().any(|s| s == requested) && existing.len() >= cap
 }
 
 /// Mask email for logging: "user@example.com" → "us***@example.com"
@@ -363,9 +370,11 @@ async fn handle_socket(
     // Real tmux-session cap: spawning a NEW session name is refused past the
     // limit; attaching to an existing session is always allowed.
     let existing = list_session_names(&user_config.unix_user).await;
-    if !existing.contains(&resolved.tmux_session)
-        && existing.len() >= state.config.terminal.max_sessions_per_user
-    {
+    if refuses_new_session(
+        &existing,
+        &resolved.tmux_session,
+        state.config.terminal.max_sessions_per_user,
+    ) {
         warn!(
             user = %display_name,
             session = %resolved.tmux_session,
@@ -577,7 +586,7 @@ async fn run_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_session_name, mask_email};
+    use super::{is_valid_session_name, mask_email, refuses_new_session};
 
     #[test]
     fn session_names_allow_alphanumeric_underscore_dash() {
@@ -594,6 +603,31 @@ mod tests {
         assert!(!is_valid_session_name("a|b"));
         assert!(!is_valid_session_name("a$b"));
         assert!(!is_valid_session_name("a.b"));
+    }
+
+    #[test]
+    fn session_names_reject_non_ascii_alphanumerics() {
+        // is_alphanumeric() would accept these; the contract is [A-Za-z0-9_-].
+        assert!(!is_valid_session_name("café"));
+        assert!(!is_valid_session_name("名前"));
+    }
+
+    #[test]
+    fn new_session_under_cap_is_allowed() {
+        let existing = vec!["a".to_string(), "b".to_string()];
+        assert!(!refuses_new_session(&existing, "c", 3));
+    }
+
+    #[test]
+    fn new_session_at_cap_is_refused() {
+        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(refuses_new_session(&existing, "d", 3));
+    }
+
+    #[test]
+    fn attach_to_existing_session_at_cap_is_allowed() {
+        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(!refuses_new_session(&existing, "b", 3));
     }
 
     #[test]

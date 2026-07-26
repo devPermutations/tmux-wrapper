@@ -297,10 +297,6 @@
         };
 
         ws.onclose = function (event) {
-            if (event.code === 4001 || event.code === 4003) {
-                showOverlay('Access denied');
-                return;
-            }
             if (event.code === 4004) {
                 // Server refused: connection or session limit reached.
                 // Show the reason, then return to the picker so the user
