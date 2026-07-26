@@ -3,41 +3,13 @@
 
     const TAG_DATA = 0x00;
     const TAG_CONTROL = 0x01;
-    const TAG_AUDIO = 0x02;
-    const TAG_TTS_CTRL = 0x03;
 
     // --- State ---
     let ws = null;
     let currentSession = null;
     let reconnectDelay = 1000;
     let ctrlActive = false;
-    let ttsEnabled = false;
     const MAX_RECONNECT_DELAY = 30000;
-
-    // --- TTS audio playback queue ---
-    var audioQueue = [];
-    var audioPlaying = false;
-    var currentAudio = null;
-
-    function playNextAudio() {
-        if (audioQueue.length === 0) { audioPlaying = false; currentAudio = null; return; }
-        audioPlaying = true;
-        var blob = new Blob([audioQueue.shift()], { type: 'audio/ogg' });
-        currentAudio = new Audio(URL.createObjectURL(blob));
-        currentAudio.onended = function () { URL.revokeObjectURL(currentAudio.src); playNextAudio(); };
-        currentAudio.onerror = function () { URL.revokeObjectURL(currentAudio.src); playNextAudio(); };
-        currentAudio.play().catch(function () { playNextAudio(); });
-    }
-
-    function stopAllAudio() {
-        audioQueue = [];
-        audioPlaying = false;
-        if (currentAudio) {
-            currentAudio.pause();
-            URL.revokeObjectURL(currentAudio.src);
-            currentAudio = null;
-        }
-    }
 
     // --- Terminal setup ---
     const term = new Terminal({
@@ -100,7 +72,9 @@
             const resp = await fetch('/api/sessions');
             if (!resp.ok) {
                 if (resp.status === 401) {
-                    window.location.href = '/login.html';
+                    // Cloudflare Access token missing/expired — a full reload
+                    // bounces through CF Access and re-authenticates.
+                    showOverlay('Session expired — reload the page');
                     return null;
                 }
                 if (resp.status === 403) {
@@ -239,12 +213,6 @@
     }
 
     function switchSession() {
-        // Stop TTS and disconnect
-        if (ttsEnabled) {
-            ttsEnabled = false;
-            document.getElementById('btn-tts').classList.remove('active');
-        }
-        stopAllAudio();
         if (ws) {
             ws.onclose = null;
             ws.onerror = null;
@@ -325,16 +293,19 @@
             if (data.length < 1) return;
             if (data[0] === TAG_DATA) {
                 term.write(data.slice(1));
-            } else if (data[0] === TAG_AUDIO) {
-                audioQueue.push(data.slice(1));
-                if (!audioPlaying) playNextAudio();
             }
         };
 
         ws.onclose = function (event) {
-            stopAllAudio();
-            if (event.code === 4001 || event.code === 4003) {
-                showOverlay('Access denied');
+            if (event.code === 4004) {
+                // Server refused: connection or session limit reached.
+                // Show the reason, then return to the picker so the user
+                // can kill an old session.
+                showOverlay(event.reason || 'Limit reached');
+                setTimeout(function () {
+                    hideOverlay();
+                    switchSession();
+                }, 3000);
                 return;
             }
             scheduleReconnect();
@@ -416,23 +387,6 @@
 
         if (key === 'sessions') {
             switchSession();
-            return;
-        }
-
-        if (key === 'tts') {
-            ttsEnabled = !ttsEnabled;
-            document.getElementById('btn-tts').classList.toggle('active', ttsEnabled);
-            if (!ttsEnabled) {
-                stopAllAudio();
-            }
-            var ctrl = new TextEncoder().encode(JSON.stringify({ enabled: ttsEnabled }));
-            var frame = new Uint8Array(1 + ctrl.length);
-            frame[0] = TAG_TTS_CTRL;
-            frame.set(ctrl, 1);
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(frame.buffer);
-            }
-            term.focus();
             return;
         }
 

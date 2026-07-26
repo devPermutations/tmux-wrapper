@@ -2,7 +2,7 @@ use crate::user::ResolvedUser;
 use nix::libc;
 use nix::pty::openpty;
 use nix::sys::signal;
-use nix::unistd::{setsid, ForkResult, Pid, Uid, fork};
+use nix::unistd::{ForkResult, Pid, Uid, fork, setsid};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -18,7 +18,7 @@ pub struct PtyMaster {
 
 impl PtyMaster {
     pub fn spawn(user: &ResolvedUser) -> io::Result<Self> {
-        let pty = openpty(None, None).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let pty = openpty(None, None).map_err(io::Error::other)?;
         let master_fd = pty.master;
         let slave_fd = pty.slave;
 
@@ -30,7 +30,7 @@ impl PtyMaster {
         let username = user_name_from_uid(uid);
 
         // Safety: fork
-        let fork_result = unsafe { fork() }.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let fork_result = unsafe { fork() }.map_err(io::Error::other)?;
 
         match fork_result {
             ForkResult::Parent { child } => {
@@ -42,8 +42,7 @@ impl PtyMaster {
                 let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
                 unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) };
 
-                let async_fd = AsyncFd::new(master_fd)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let async_fd = AsyncFd::new(master_fd).map_err(io::Error::other)?;
 
                 Ok(PtyMaster {
                     async_fd,
@@ -113,11 +112,11 @@ impl PtyMaster {
                     let home_c = CString::new(home.as_str()).unwrap_or_default();
                     let user_c = CString::new(username.as_str()).unwrap_or_default();
                     let shell_c = CString::new(shell.as_str()).unwrap_or_default();
-                    libc::setenv(b"HOME\0".as_ptr().cast(), home_c.as_ptr(), 1);
-                    libc::setenv(b"USER\0".as_ptr().cast(), user_c.as_ptr(), 1);
-                    libc::setenv(b"SHELL\0".as_ptr().cast(), shell_c.as_ptr(), 1);
-                    libc::setenv(b"TERM\0".as_ptr().cast(), b"xterm-256color\0".as_ptr().cast(), 1);
-                    libc::unsetenv(b"TMUX\0".as_ptr().cast());
+                    libc::setenv(c"HOME".as_ptr(), home_c.as_ptr(), 1);
+                    libc::setenv(c"USER".as_ptr(), user_c.as_ptr(), 1);
+                    libc::setenv(c"SHELL".as_ptr(), shell_c.as_ptr(), 1);
+                    libc::setenv(c"TERM".as_ptr(), c"xterm-256color".as_ptr(), 1);
+                    libc::unsetenv(c"TMUX".as_ptr());
                 }
 
                 // chdir using libc — same reason as above
@@ -154,10 +153,7 @@ impl PtyMaster {
 impl Drop for PtyMaster {
     fn drop(&mut self) {
         let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGHUP);
-        let _ = nix::sys::wait::waitpid(
-            self.child_pid,
-            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-        );
+        let _ = nix::sys::wait::waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
     }
 }
 
@@ -177,7 +173,11 @@ impl AsyncRead for PtyMaster {
             let fd = self.async_fd.get_ref().as_raw_fd();
             let unfilled = buf.initialize_unfilled();
             let n = unsafe {
-                libc::read(fd, unfilled.as_mut_ptr() as *mut libc::c_void, unfilled.len())
+                libc::read(
+                    fd,
+                    unfilled.as_mut_ptr() as *mut libc::c_void,
+                    unfilled.len(),
+                )
             };
 
             if n > 0 {
@@ -211,9 +211,7 @@ impl AsyncWrite for PtyMaster {
             };
 
             let fd = self.async_fd.get_ref().as_raw_fd();
-            let n = unsafe {
-                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
 
             if n >= 0 {
                 return Poll::Ready(Ok(n as usize));

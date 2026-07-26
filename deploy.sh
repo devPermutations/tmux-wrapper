@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SRC="$HOME/projects/tmuxwrapper"
+SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="/opt/tmuxwrapper"
 
 echo "==> Creating $DEST"
@@ -17,6 +17,10 @@ sudo cp "$SRC/config.toml" "$DEST/"
 echo "==> Copying static files"
 sudo cp "$SRC/static/"*.html "$SRC/static/"*.js "$SRC/static/"*.css "$SRC/static/"*.json "$SRC/static/"*.png "$DEST/static/"
 sudo cp "$SRC/static/vendor/"* "$DEST/static/vendor/"
+
+echo "==> Installing session-save helper"
+sudo cp "$SRC/save-sessions.sh" "$DEST/save-sessions.sh"
+sudo chmod +x "$DEST/save-sessions.sh"
 
 echo "==> Installing systemd service"
 sudo cp "$SRC/tmuxwrapper.service" /etc/systemd/system/

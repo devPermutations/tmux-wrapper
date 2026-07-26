@@ -13,8 +13,8 @@ RestartSec=3
 # Only kill the main process, not forked tmux servers/shells
 KillMode=process
 
-# Save tmux sessions before stopping (for all users with tmux)
-ExecStop=/bin/bash -c 'for u in $(ps -eo user= -o comm= | grep "tmux: server" | awk "{print \\$1}" | sort -u); do su - "$u" -c "~/.tmux/plugins/tmux-resurrect/scripts/save.sh" 2>/dev/null; done'
+# Best-effort tmux-resurrect save before stopping (no-op if not installed)
+ExecStop=/opt/tmuxwrapper/save-sessions.sh
 
 # Needs root to setuid/setgid into target users
 User=root

@@ -19,21 +19,21 @@ browser ─► permutations cloudflare ─► your host (127.0.0.1:7681) ─► 
 
 ## Why this exists
 
-The first version of this had two auth modes (local password + Cloudflare Access) and shipped as Docker. The auth surface and TLS story were confusing. This one trims it to one path:
+The first version of this had two auth modes (local password + Cloudflare Access), a voice-output experiment, and shipped as Docker. The auth surface and TLS story were confusing. This one trims it to one path:
 
-- **One auth mode:** Cloudflare Access. JWT in `Cf-Access-Jwt-Assertion`, verified against your team's JWKS. If the request reaches the binary, it's already authenticated.
+- **One auth mode:** Cloudflare Access. JWT in `Cf-Access-Jwt-Assertion`, verified against your team's JWKS. If the request reaches the binary, it's already authenticated. There is no password fallback in the code — not disabled, gone.
 - **One transport:** the binary binds `127.0.0.1:7681`. TLS isn't its problem — Cloudflare terminates it, the tunnel carries plain HTTP from the edge to your box.
-- **One artifact:** a Rust binary + a `config.toml` + a systemd unit. No Docker required.
+- **One artifact:** a Rust binary + a `config.toml` + a systemd unit. No Docker.
 
 If you need local password auth or self-hosted TLS, this isn't the project for you.
 
 ## Features
 
-- **Cloudflare Access auth** — JWT verified against your team's JWKS (cached, periodic refresh)
+- **Cloudflare Access auth** — JWT verified against your team's JWKS (cached, periodic refresh; failed fetches retry with backoff so a blip at boot doesn't lock everyone out)
 - **Email → unix user** — the email in the access JWT maps to a real account on the box, isolated per user via setuid
 - **Tmux per user** — every session attaches to a named tmux session as the target unix user
-- **Voice output (opt-in)** — server-side [Piper](https://github.com/rhasspy/piper) TTS streamed over the existing WebSocket as `0x02` audio frames
-- **Systemd-managed** — capability-bounded service, sessions can be restored on reboot via tmux-resurrect
+- **Session caps** — at most 5 WebSocket connections per user, and a configurable cap on distinct tmux sessions (`max_sessions_per_user`, default 5). Creating a session past the cap is refused with a visible message; attaching to an existing one always works
+- **Systemd-managed** — capability-bounded service; sessions are saved on stop via tmux-resurrect if it's installed, silently skipped if not
 - **PWA-ready** — installable on iOS/Android, touch-friendly key bar, dictation support
 
 ## Quickstart
@@ -75,11 +75,7 @@ jwks_refresh_secs = 3600
 
 [terminal]
 ping_interval_secs = 30
-
-[tts]
-piper_binary = "/opt/piper/piper"
-voices_dir = "/opt/piper/voices"
-default_voice = "en_US-joe-medium"
+max_sessions_per_user = 5    # tmux sessions per user; attach is always allowed
 
 [[users]]
 email = "you@example.com"
@@ -98,20 +94,6 @@ Add one `[[users]]` block per allowed user. Emails not in the list are rejected 
 5. Set your `team_domain` to the subdomain in your team URL (`https://<team_domain>.cloudflareaccess.com`).
 
 Tunnel the application hostname (`term.example.com`) to `http://127.0.0.1:7681` on your host using `cloudflared` or a sidecar tunnel.
-
-## Voice output (optional)
-
-Install Piper and at least one voice:
-
-```bash
-sudo mkdir -p /opt/piper/voices
-# install the Piper binary (https://github.com/rhasspy/piper/releases) to /opt/piper/piper
-# drop voice .onnx + .json files into /opt/piper/voices
-```
-
-In the browser, toggle voice on per session. The server strips ANSI escapes, buffers output to sentence boundaries, pipes through Piper, and streams audio frames back over the WebSocket.
-
-See [`voice-implementation.md`](./voice-implementation.md) for the pipeline details.
 
 ## What runs as root
 

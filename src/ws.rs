@@ -1,27 +1,43 @@
-use crate::auth::AuthProvider;
-use crate::config::{AuthMode, Config, TtsConfig, UserConfig};
-use crate::password_auth::PasswordAuth;
+use crate::auth::JwksCache;
+use crate::config::{Config, UserConfig};
 use crate::pty::PtyMaster;
-use crate::tts::{PiperSynthesizer, split_sentences};
 use crate::user::ResolvedUser;
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, Query, State, WebSocketUpgrade};
+use axum::Json;
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, Instant, interval};
+use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
-const MAX_SESSIONS_PER_USER: usize = 5;
+/// Cap on simultaneous WebSocket connections per user (a browser tab each).
+/// Distinct from the tmux-session cap, which is configurable via
+/// `[terminal] max_sessions_per_user`.
+const MAX_CONCURRENT_CONNECTIONS_PER_USER: usize = 5;
+
+/// Close code used when a connection or session limit refuses the socket.
+/// The reason text is surfaced verbatim by the frontend.
+const CLOSE_CODE_LIMIT: u16 = 4004;
+
+/// Session names may only contain [a-zA-Z0-9_-].
+fn is_valid_session_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Tmux-session cap decision: refuse only when the requested name is NEW and
+/// the user is already at the cap. Attaching to an existing session is always
+/// allowed regardless of the cap.
+fn refuses_new_session(existing: &[String], requested: &str, cap: usize) -> bool {
+    !existing.iter().any(|s| s == requested) && existing.len() >= cap
+}
 
 /// Mask email for logging: "user@example.com" → "us***@example.com"
 fn mask_email(email: &str) -> String {
@@ -34,64 +50,10 @@ fn mask_email(email: &str) -> String {
     }
 }
 
-/// Mask username for logging: "ktulu" → "kt***"
-fn mask_username(username: &str) -> String {
-    let visible = if username.len() <= 2 { username.len() } else { 2 };
-    format!("{}***", &username[..visible])
-}
-
-/// Per-IP login attempt tracker for brute-force protection.
-pub struct LoginRateLimiter {
-    /// Maps IP → (failure count, window start).
-    attempts: Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>,
-}
-
-const MAX_LOGIN_ATTEMPTS: u32 = 5;
-const LOGIN_WINDOW_SECS: u64 = 60;
-
-impl LoginRateLimiter {
-    pub fn new() -> Self {
-        Self {
-            attempts: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Returns true if the IP is rate-limited (too many failures).
-    async fn is_limited(&self, ip: std::net::IpAddr) -> bool {
-        let mut map = self.attempts.lock().await;
-        if let Some((count, start)) = map.get(&ip) {
-            if start.elapsed().as_secs() >= LOGIN_WINDOW_SECS {
-                map.remove(&ip);
-                return false;
-            }
-            *count >= MAX_LOGIN_ATTEMPTS
-        } else {
-            false
-        }
-    }
-
-    /// Record a failed login attempt for an IP.
-    async fn record_failure(&self, ip: std::net::IpAddr) {
-        let mut map = self.attempts.lock().await;
-        let entry = map.entry(ip).or_insert((0, Instant::now()));
-        if entry.1.elapsed().as_secs() >= LOGIN_WINDOW_SECS {
-            *entry = (1, Instant::now());
-        } else {
-            entry.0 += 1;
-        }
-    }
-
-    /// Clear failures for an IP after successful login.
-    async fn clear(&self, ip: std::net::IpAddr) {
-        self.attempts.lock().await.remove(&ip);
-    }
-}
-
 pub struct AppState {
     pub config: Config,
-    pub auth: AuthProvider,
+    pub jwks: JwksCache,
     pub sessions: Mutex<HashMap<String, usize>>,
-    pub login_limiter: LoginRateLimiter,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,200 +76,57 @@ pub struct TmuxSession {
     attached: bool,
 }
 
-/// Authenticated identity — either an email (CF) or username (password).
+/// Authenticated identity derived from a verified Cloudflare Access JWT.
 struct AuthIdentity {
-    /// Key used for session counting (email or username).
+    /// Key used for session counting (the JWT email).
     key: String,
     /// Display string for logs.
     display_name: String,
     user_config: UserConfig,
 }
 
-/// Extract and verify auth from headers, return identity on success.
-async fn authenticate(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<AuthIdentity, StatusCode> {
-    match &state.auth {
-        AuthProvider::Cloudflare(jwks) => {
-            let token = headers
-                .get("Cf-Access-Jwt-Assertion")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    headers
-                        .get("cookie")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|cookies| {
-                            cookies.split(';').find_map(|c| {
-                                let c = c.trim();
-                                c.strip_prefix("CF_Authorization=").map(|t| t.to_string())
-                            })
-                        })
-                })
-                .ok_or(StatusCode::UNAUTHORIZED)?;
-
-            let claims = jwks
-                .verify(&token)
-                .await
-                .map_err(|e| {
-                    warn!(error = %e, "JWT verification failed");
-                    StatusCode::UNAUTHORIZED
-                })?;
-
-            let user_config = state
-                .config
-                .find_user(&claims.email)
-                .cloned()
-                .ok_or_else(|| {
-                    warn!(email = %mask_email(&claims.email), "no user mapping found");
-                    StatusCode::FORBIDDEN
-                })?;
-
-            Ok(AuthIdentity {
-                display_name: mask_email(&claims.email),
-                key: claims.email,
-                user_config,
-            })
-        }
-        AuthProvider::Password(pw_auth) => {
-            let token = headers
+/// Extract and verify the Cloudflare Access JWT, return identity on success.
+async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthIdentity, StatusCode> {
+    let token = headers
+        .get("Cf-Access-Jwt-Assertion")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            headers
                 .get("cookie")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|cookies| {
                     cookies.split(';').find_map(|c| {
                         let c = c.trim();
-                        c.strip_prefix("tmw_session=").map(|t| t.to_string())
+                        c.strip_prefix("CF_Authorization=").map(|t| t.to_string())
                     })
                 })
-                .ok_or(StatusCode::UNAUTHORIZED)?;
+        })
+        .ok_or(StatusCode::UNAUTHORIZED)?;
 
-            let username = pw_auth
-                .verify_session_token(&token)
-                .ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = state.jwks.verify(&token).await.map_err(|e| {
+        warn!(error = %e, "JWT verification failed");
+        StatusCode::UNAUTHORIZED
+    })?;
 
-            let user_config = state
-                .config
-                .find_user_by_username(&username)
-                .cloned()
-                .ok_or_else(|| {
-                    warn!(user = %mask_username(&username), "no user mapping found");
-                    StatusCode::FORBIDDEN
-                })?;
+    let user_config = state
+        .config
+        .find_user(&claims.email)
+        .cloned()
+        .ok_or_else(|| {
+            warn!(email = %mask_email(&claims.email), "no user mapping found");
+            StatusCode::FORBIDDEN
+        })?;
 
-            Ok(AuthIdentity {
-                display_name: mask_username(&username),
-                key: username,
-                user_config,
-            })
-        }
-    }
-}
-
-/// POST /api/login — password auth login
-#[derive(Deserialize)]
-pub struct LoginRequest {
-    username: String,
-    password: String,
-}
-
-pub async fn login_handler(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<LoginRequest>,
-) -> Response {
-    let pw_auth = match &state.auth {
-        AuthProvider::Password(pw) => pw,
-        AuthProvider::Cloudflare(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    // Rate limit — 5 failed attempts per IP per minute
-    let client_ip = addr.ip();
-    if state.login_limiter.is_limited(client_ip).await {
-        warn!(ip = %client_ip, "login rate-limited");
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-
-    // Origin check — reject cross-origin login attempts
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-        let origin_host = origin
-            .strip_prefix("https://")
-            .or_else(|| origin.strip_prefix("http://"))
-            .unwrap_or(origin)
-            .split(':')
-            .next()
-            .unwrap_or("");
-        let host_name = host.split(':').next().unwrap_or("");
-        if origin_host != host_name {
-            warn!(origin = %origin, "rejected login: origin mismatch");
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    }
-
-    let user = match state.config.find_user_by_username(&body.username) {
-        Some(u) => u.clone(),
-        None => {
-            warn!(user = %mask_username(&body.username), "login: unknown user");
-            state.login_limiter.record_failure(client_ip).await;
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    };
-
-    let hash = match &user.password_hash {
-        Some(h) => h.clone(),
-        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let password = body.password.clone();
-    let valid = match tokio::task::spawn_blocking(move || {
-        PasswordAuth::verify_password(&hash, &password)
+    Ok(AuthIdentity {
+        display_name: mask_email(&claims.email),
+        key: claims.email,
+        user_config,
     })
-    .await
-    {
-        Ok(Ok(true)) => true,
-        Ok(Ok(false)) => {
-            warn!(user = %mask_username(&body.username), "login: wrong password");
-            false
-        }
-        Ok(Err(e)) => {
-            error!(error = %e, "bcrypt error");
-            false
-        }
-        Err(e) => {
-            error!(error = %e, "spawn_blocking failed");
-            false
-        }
-    };
-
-    if !valid {
-        state.login_limiter.record_failure(client_ip).await;
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    state.login_limiter.clear(client_ip).await;
-    let token = pw_auth.create_session_token(&body.username);
-    let max_age = pw_auth.session_duration_secs();
-    info!(user = %mask_username(&body.username), "login successful");
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            "Set-Cookie",
-            format!("tmw_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age}"),
-        )
-        .header("Content-Type", "application/json")
-        .body(axum::body::Body::from(r#"{"ok":true}"#))
-        .unwrap()
-        .into_response()
 }
 
 /// GET /api/sessions — list tmux sessions for the authenticated user
-pub async fn sessions_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn sessions_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let identity = match authenticate(&state, &headers).await {
         Ok(v) => v,
         Err(status) => return status.into_response(),
@@ -363,12 +182,19 @@ pub async fn kill_session_handler(
     };
 
     // Validate session name
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+    if !is_valid_session_name(&name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
     let output = tokio::process::Command::new("/usr/bin/sudo")
-        .args(["-u", &identity.user_config.unix_user, "/usr/bin/tmux", "kill-session", "-t", &name])
+        .args([
+            "-u",
+            &identity.user_config.unix_user,
+            "/usr/bin/tmux",
+            "kill-session",
+            "-t",
+            &name,
+        ])
         .output()
         .await;
 
@@ -395,24 +221,24 @@ pub async fn ws_handler(
     headers: HeaderMap,
     Query(query): Query<WsQuery>,
 ) -> Response {
-    // Origin check for CF mode (SameSite=None cookies need server-side CSRF protection).
-    // Password mode uses SameSite=Strict cookies, which handles CSRF.
-    if matches!(state.config.parsed_auth_mode(), Ok(AuthMode::Cloudflare)) {
-        if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-            let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-            // Extract hostname only (strip scheme and port) for exact comparison
-            let origin_host = origin
-                .strip_prefix("https://")
-                .or_else(|| origin.strip_prefix("http://"))
-                .unwrap_or(origin)
-                .split(':')
-                .next()
-                .unwrap_or("");
-            let host_name = host.split(':').next().unwrap_or("");
-            if origin_host != host_name {
-                warn!(origin = %origin, host = %host, "rejected WebSocket: origin mismatch");
-                return StatusCode::FORBIDDEN.into_response();
-            }
+    // Origin check (CF Access SameSite=None cookies need server-side CSRF protection).
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Extract hostname only (strip scheme and port) for exact comparison
+        let origin_host = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .unwrap_or(origin)
+            .split(':')
+            .next()
+            .unwrap_or("");
+        let host_name = host.split(':').next().unwrap_or("");
+        if origin_host != host_name {
+            warn!(origin = %origin, host = %host, "rejected WebSocket: origin mismatch");
+            return StatusCode::FORBIDDEN.into_response();
         }
     }
 
@@ -423,17 +249,83 @@ pub async fn ws_handler(
 
     // Validate requested session name if provided
     let session_name = query.session.clone();
-    if let Some(ref name) = session_name {
-        if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-            return StatusCode::BAD_REQUEST.into_response();
-        }
+    if let Some(ref name) = session_name
+        && !is_valid_session_name(name)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let state_clone = Arc::clone(&state);
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, state_clone, identity.key, identity.display_name, identity.user_config, session_name)
+        handle_socket(
+            socket,
+            state_clone,
+            identity.key,
+            identity.display_name,
+            identity.user_config,
+            session_name,
+        )
     })
     .into_response()
+}
+
+/// Refuse a freshly upgraded socket with a close frame the frontend surfaces.
+async fn refuse_socket(mut socket: WebSocket, reason: &str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: CLOSE_CODE_LIMIT,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+/// Names of the user's existing tmux sessions.
+/// Empty when the user's tmux server isn't running.
+///
+/// Fails open (returns empty) on any error so a broken listing can't lock
+/// users out, but warns unless the failure is the legitimate "no sessions"
+/// case — otherwise e.g. a sudo misconfiguration would silently disable the
+/// session cap (PTY spawn doesn't go through sudo, so sessions still spawn).
+async fn list_session_names(unix_user: &str) -> Vec<String> {
+    let output = tokio::process::Command::new("/usr/bin/sudo")
+        .args([
+            "-u",
+            unix_user,
+            "/usr/bin/tmux",
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // tmux exits non-zero with these when the user simply has no
+            // running server — not worth a warning.
+            if !stderr.contains("no server running") && !stderr.contains("error connecting") {
+                warn!(
+                    unix_user = %unix_user,
+                    status = %out.status,
+                    stderr = %stderr.trim(),
+                    "tmux list-sessions failed — session cap not enforced for this connection"
+                );
+            }
+            Vec::new()
+        }
+        Err(e) => {
+            warn!(
+                unix_user = %unix_user,
+                error = %e,
+                "failed to run tmux list-sessions — session cap not enforced for this connection"
+            );
+            Vec::new()
+        }
+    }
 }
 
 async fn handle_socket(
@@ -444,12 +336,17 @@ async fn handle_socket(
     user_config: UserConfig,
     session_name: Option<String>,
 ) {
-    // Atomic check + increment session limit
+    // Atomic check + increment of the per-user WebSocket connection count
     {
         let mut sessions = state.sessions.lock().await;
         let count = sessions.get(&session_key).copied().unwrap_or(0);
-        if count >= MAX_SESSIONS_PER_USER {
-            warn!(user = %display_name, count, "session limit reached");
+        if count >= MAX_CONCURRENT_CONNECTIONS_PER_USER {
+            warn!(user = %display_name, count, "connection limit reached");
+            refuse_socket(
+                socket,
+                "connection limit reached — close another terminal tab first",
+            )
+            .await;
             return;
         }
         *sessions.entry(session_key.clone()).or_insert(0) += 1;
@@ -470,6 +367,25 @@ async fn handle_socket(
         resolved.tmux_session = name;
     }
 
+    // Real tmux-session cap: spawning a NEW session name is refused past the
+    // limit; attaching to an existing session is always allowed.
+    let existing = list_session_names(&user_config.unix_user).await;
+    if refuses_new_session(
+        &existing,
+        &resolved.tmux_session,
+        state.config.terminal.max_sessions_per_user,
+    ) {
+        warn!(
+            user = %display_name,
+            session = %resolved.tmux_session,
+            existing = existing.len(),
+            "tmux session limit reached"
+        );
+        refuse_socket(socket, "session limit reached — kill an old session first").await;
+        decrement_session(&state, &session_key).await;
+        return;
+    }
+
     info!(
         user = %display_name,
         unix_user = %user_config.unix_user,
@@ -488,9 +404,14 @@ async fn handle_socket(
     };
 
     let session_label = resolved.tmux_session.clone();
-    let tts_config = state.config.tts.clone();
-    let unix_user = user_config.unix_user.clone();
-    run_bridge(socket, pty, state.config.terminal.ping_interval_secs, &display_name, &session_label, tts_config, &unix_user).await;
+    run_bridge(
+        socket,
+        pty,
+        state.config.terminal.ping_interval_secs,
+        &display_name,
+        &session_label,
+    )
+    .await;
     decrement_session(&state, &session_key).await;
     info!(user = %display_name, "session ended");
 }
@@ -515,19 +436,22 @@ fn pty_resize(fd: &OwnedFd, cols: u16, rows: u16) {
     unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 }
 
-#[derive(Debug, Deserialize)]
-struct TtsControl {
-    enabled: bool,
-}
-
+// Binary WebSocket protocol:
+//   0x00 — raw terminal data (both directions)
+//   0x01 — JSON control message, client → server (currently only resize)
 enum WsInput {
     Data(Vec<u8>),
     Resize(u16, u16),
-    TtsToggle(bool),
     Close,
 }
 
-async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u64, user: &str, session: &str, tts_config: Option<TtsConfig>, unix_user: &str) {
+async fn run_bridge(
+    mut socket: WebSocket,
+    pty: PtyMaster,
+    ping_interval_secs: u64,
+    user: &str,
+    session: &str,
+) {
     let user = user.to_string();
     let session = session.to_string();
     // dup() the PTY fd for resize ioctls — owns its own fd independently
@@ -536,10 +460,6 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
     let (mut pty_read, mut pty_write) = tokio::io::split(pty);
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(16);
     let (ws_in_tx, mut ws_in_rx) = mpsc::channel::<WsInput>(16);
-
-    // TTS state — shared between tasks
-    let tts_enabled = Arc::new(AtomicBool::new(false));
-    let tts_file = format!("/tmp/tmuxwrapper-tts-{}-{}", unix_user, session);
 
     // Task 1: WebSocket I/O loop — owns the socket
     let user1 = user.clone();
@@ -567,13 +487,6 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
                                         } else {
                                             continue;
                                         }
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                0x03 => {
-                                    if let Ok(ctrl) = serde_json::from_slice::<TtsControl>(&data[1..]) {
-                                        WsInput::TtsToggle(ctrl.enabled)
                                     } else {
                                         continue;
                                     }
@@ -639,7 +552,6 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
     });
 
     // Task 3: WebSocket → PTY
-    let tts_enabled_clone = Arc::clone(&tts_enabled);
     let mut ws_to_pty = tokio::spawn(async move {
         while let Some(input) = ws_in_rx.recv().await {
             match input {
@@ -654,60 +566,7 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
                         pty_resize(fd, cols, rows);
                     }
                 }
-                WsInput::TtsToggle(enabled) => {
-                    tts_enabled_clone.store(enabled, Ordering::Relaxed);
-                    info!(tts = enabled, "TTS toggled");
-                }
                 WsInput::Close => break,
-            }
-        }
-    });
-
-    // Task 4: TTS file watcher — polls for response text written by Claude Code's Stop hook
-    let ws_out_tx_tts = ws_out_tx.clone();
-    let tts_enabled_clone2 = Arc::clone(&tts_enabled);
-    let mut tts_task = tokio::spawn(async move {
-        let synthesizer = match tts_config {
-            Some(ref cfg) => PiperSynthesizer::new(&cfg.piper_binary, &cfg.voices_dir, &cfg.default_voice),
-            None => return,
-        };
-
-        loop {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-
-            if !tts_enabled_clone2.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            // Check if the hook wrote a response file
-            let text = match tokio::fs::read_to_string(&tts_file).await {
-                Ok(t) if !t.trim().is_empty() => {
-                    // Remove the file immediately so we don't re-process it
-                    let _ = tokio::fs::remove_file(&tts_file).await;
-                    t
-                }
-                _ => continue,
-            };
-
-            // Split into sentences and synthesize each
-            let sentences = split_sentences(&text);
-            for sentence in sentences {
-                // Check if TTS was disabled while we're synthesizing
-                if !tts_enabled_clone2.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Some(audio) = synthesizer.speak(sentence).await {
-                    let mut frame = Vec::with_capacity(1 + audio.len());
-                    frame.push(0x02);
-                    frame.extend_from_slice(&audio);
-                    if ws_out_tx_tts
-                        .send(Message::Binary(frame.into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
             }
         }
     });
@@ -717,12 +576,64 @@ async fn run_bridge(mut socket: WebSocket, pty: PtyMaster, ping_interval_secs: u
         _ = &mut ws_task => {}
         _ = &mut pty_to_ws => {}
         _ = &mut ws_to_pty => {}
-        _ = &mut tts_task => {}
     }
 
     ws_task.abort();
     pty_to_ws.abort();
     ws_to_pty.abort();
-    tts_task.abort();
     drop(ws_out_tx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_session_name, mask_email, refuses_new_session};
+
+    #[test]
+    fn session_names_allow_alphanumeric_underscore_dash() {
+        assert!(is_valid_session_name("main"));
+        assert!(is_valid_session_name("my-session_2"));
+        assert!(is_valid_session_name("A1"));
+    }
+
+    #[test]
+    fn session_names_reject_shell_and_path_metacharacters() {
+        assert!(!is_valid_session_name("main session"));
+        assert!(!is_valid_session_name("../etc"));
+        assert!(!is_valid_session_name("a;rm -rf"));
+        assert!(!is_valid_session_name("a|b"));
+        assert!(!is_valid_session_name("a$b"));
+        assert!(!is_valid_session_name("a.b"));
+    }
+
+    #[test]
+    fn session_names_reject_non_ascii_alphanumerics() {
+        // is_alphanumeric() would accept these; the contract is [A-Za-z0-9_-].
+        assert!(!is_valid_session_name("café"));
+        assert!(!is_valid_session_name("名前"));
+    }
+
+    #[test]
+    fn new_session_under_cap_is_allowed() {
+        let existing = vec!["a".to_string(), "b".to_string()];
+        assert!(!refuses_new_session(&existing, "c", 3));
+    }
+
+    #[test]
+    fn new_session_at_cap_is_refused() {
+        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(refuses_new_session(&existing, "d", 3));
+    }
+
+    #[test]
+    fn attach_to_existing_session_at_cap_is_allowed() {
+        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(!refuses_new_session(&existing, "b", 3));
+    }
+
+    #[test]
+    fn mask_email_hides_local_part() {
+        assert_eq!(mask_email("user@example.com"), "us***@example.com");
+        assert_eq!(mask_email("ab@example.com"), "ab***@example.com");
+        assert_eq!(mask_email("not-an-email"), "***");
+    }
 }
