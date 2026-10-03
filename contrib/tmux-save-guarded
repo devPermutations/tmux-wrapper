@@ -1,0 +1,34 @@
+#!/bin/bash
+# Shutdown-time tmux-resurrect save that can never clobber a good save.
+#
+# Called from tmux-server.service ExecStop, *before* kill-server. At shutdown
+# the pane scopes are torn down in parallel with this unit, so the save may
+# see a dying or already-empty server. On 2026-09-19 an unguarded save wrote a
+# 0-byte file, `last` was repointed at it, and continuum restored nothing on
+# boot. Rule: a shutdown save is only kept if it has at least as many panes
+# as the save it replaces; otherwise `last` is rolled back (worst case we
+# fall back to continuum's periodic save, <=15 min old).
+
+dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+[ -d "$dir" ] || dir="$HOME/.tmux/resurrect"
+
+panes() { local n; n="$(grep -c '^pane' "$1" 2>/dev/null)"; echo "${n:-0}"; }
+
+prev="$(readlink -f "$dir/last" 2>/dev/null)"
+
+"$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" quiet >/dev/null 2>&1
+
+new="$(readlink -f "$dir/last" 2>/dev/null)"
+
+# Sweep empty saves regardless of who `last` points at.
+find "$dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -size 0 ! -samefile "${new:-/dev/null}" -delete 2>/dev/null
+
+[ -n "$prev" ] && [ -f "$prev" ] || exit 0
+[ "$new" != "$prev" ] || exit 0
+
+if [ "$(panes "$new")" -lt "$(panes "$prev")" ]; then
+	ln -sfn "$(basename "$prev")" "$dir/last"
+	rm -f "$new"
+	echo "tmux-save-guarded: rejected degraded save ($(basename "$new")), kept $(basename "$prev")" >&2
+fi
+exit 0

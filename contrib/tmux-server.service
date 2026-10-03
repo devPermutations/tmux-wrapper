@@ -1,0 +1,26 @@
+[Unit]
+Description=tmux server in a clean context (web wrapper and SSH attach here)
+# tmuxwrapper.service is hardened (ProtectSystem=strict + capability
+# bounding set). A tmux server first started through the wrapper would
+# inherit that jail, and every pane in every session — web OR ssh — would
+# lose sudo and a writable /. Run the server from this user unit instead;
+# the wrapper only attaches, and starts this unit if the server is down.
+#
+# Install per user (lingering keeps it up without a login):
+#   cp tmux-server.service ~/.config/systemd/user/
+#   cp tmux-save-guarded ~/.local/bin/        # optional, needs tmux-resurrect
+#   systemctl --user enable --now tmux-server.service
+#   sudo loginctl enable-linger "$USER"
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/tmux new-session -d -s main
+# Save sessions while the server is still alive, then kill it — sequential,
+# so no race. The guard refuses to repoint `last` at a degraded/empty save.
+# The leading '-' makes the save optional.
+ExecStop=-%h/.local/bin/tmux-save-guarded
+ExecStop=/usr/bin/tmux kill-server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
