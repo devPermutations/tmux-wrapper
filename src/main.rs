@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod helper;
 mod helper_client;
+mod helper_watch;
 mod privdrop;
 mod proto;
 mod pty;
@@ -77,7 +78,7 @@ fn main() {
         ));
     }
 
-    let helper_socks = fork_helpers(users, &config);
+    let helpers = fork_helpers(users, &config);
 
     if let Err(e) = drop_privileges(run_as.uid, run_as.gid, &[]) {
         fatal(&format!("front: {e}"));
@@ -91,7 +92,7 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|e| fatal(&format!("failed to build tokio runtime: {e}")));
-    rt.block_on(run_front(config, helper_socks));
+    rt.block_on(run_front(config, helpers));
 }
 
 /// Log and exit non-zero. Only for startup, before any input is handled.
@@ -100,12 +101,17 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-/// Fork one helper per resolved user and return the front's socket ends,
-/// keyed by unix user. Runs as root, single-threaded.
-fn fork_helpers(
-    users: Vec<(&UserConfig, ResolvedUser)>,
-    config: &Config,
-) -> Vec<(String, OwnedFd)> {
+/// A forked helper as the front sees it: its unix user, pid and the front's
+/// end of its socket.
+struct ForkedHelper {
+    unix_user: String,
+    pid: Pid,
+    sock: OwnedFd,
+}
+
+/// Fork one helper per resolved user and return them. Runs as root,
+/// single-threaded.
+fn fork_helpers(users: Vec<(&UserConfig, ResolvedUser)>, config: &Config) -> Vec<ForkedHelper> {
     // Guard the invariant the forks rely on (see main).
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     if !status
@@ -115,7 +121,7 @@ fn fork_helpers(
         fatal("refusing to fork helpers: process is not single-threaded");
     }
     let parent = getpid();
-    let mut fronts: Vec<(String, OwnedFd)> = Vec::new();
+    let mut fronts: Vec<ForkedHelper> = Vec::new();
     for (user, resolved) in users {
         let (front, back) = seqpacket_pair()
             .unwrap_or_else(|e| fatal(&format!("failed to create helper socket: {e}")));
@@ -134,7 +140,11 @@ fn fork_helpers(
             Ok(ForkResult::Parent { child }) => {
                 drop(back);
                 info!(unix_user = %user.unix_user, pid = %child, "forked helper");
-                fronts.push((user.unix_user.clone(), front));
+                fronts.push(ForkedHelper {
+                    unix_user: user.unix_user.clone(),
+                    pid: child,
+                    sock: front,
+                });
             }
             Err(e) => fatal(&format!("fork failed: {e}")),
         }
@@ -187,8 +197,17 @@ fn become_helper(
     )
 }
 
-/// The front, after the drop: JWKS, helper clients, HTTP.
-async fn run_front(config: Config, helper_socks: Vec<(String, OwnedFd)>) {
+/// The front, after the drop: helper watch, JWKS, helper clients, HTTP.
+async fn run_front(config: Config, forked: Vec<ForkedHelper>) {
+    // First, so a helper that already died is noticed before serving.
+    let pids = forked
+        .iter()
+        .map(|h| (h.unix_user.clone(), h.pid))
+        .collect();
+    if let Err(e) = helper_watch::spawn(pids) {
+        fatal(&format!("failed to install SIGCHLD handler: {e}"));
+    }
+
     let listen_addr = config.listen.clone();
 
     let cf = &config.cloudflare;
@@ -198,12 +217,12 @@ async fn run_front(config: Config, helper_socks: Vec<(String, OwnedFd)>) {
     }
     jwks.spawn_refresh_task(cf.jwks_refresh_secs);
 
-    let helpers = helper_socks
+    let helpers = forked
         .into_iter()
-        .map(|(unix_user, sock)| {
-            let client = HelperClient::new(sock)
+        .map(|h| {
+            let client = HelperClient::new(h.sock)
                 .unwrap_or_else(|e| fatal(&format!("failed to set up helper client: {e}")));
-            (unix_user, client)
+            (h.unix_user, client)
         })
         .collect();
 
