@@ -99,7 +99,9 @@ pub fn tmux_available() -> bool {
 }
 
 impl ScratchTmux {
-    /// `None` when `/usr/bin/tmux` is absent or the server won't start.
+    /// `None` when `/usr/bin/tmux` is absent (the caller skips). Panics when
+    /// tmux is installed but the scratch server won't start: that is a
+    /// broken test environment, not a reason to skip.
     pub fn start(first_session: &str) -> Option<Self> {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -111,13 +113,19 @@ impl ScratchTmux {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("create scratch dir {}: {e}", dir.display()));
         let this = ScratchTmux {
             sock: dir.join("sock"),
             dir,
         };
-        // Constructed first so Drop cleans up even if the start fails.
-        this.new_detached(first_session).then_some(this)
+        // Constructed first so Drop cleans up when the start fails.
+        assert!(
+            this.new_detached(first_session),
+            "/usr/bin/tmux is installed but the scratch server on {} did not start",
+            this.sock.display()
+        );
+        Some(this)
     }
 
     pub fn socket(&self) -> &std::path::Path {
@@ -144,5 +152,23 @@ impl Drop for ScratchTmux {
             .arg("kill-server")
             .status();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With tmux installed, a scratch server that won't start is a test
+    /// failure, not a silent skip.
+    #[test]
+    fn scratch_start_failure_panics_when_tmux_is_installed() {
+        if !tmux_available() {
+            eprintln!("skipping: /usr/bin/tmux not available");
+            return;
+        }
+        // tmux refuses an empty session name.
+        let res = std::panic::catch_unwind(|| ScratchTmux::start(""));
+        assert!(res.is_err(), "start(\"\") returned instead of panicking");
     }
 }

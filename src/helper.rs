@@ -251,7 +251,7 @@ mod tests {
     use crate::pty::PtyMaster;
     use crate::test_support::{self, ScratchTmux};
     use jsonwebtoken::{Algorithm, DecodingKey, Header};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncReadExt;
 
@@ -321,6 +321,26 @@ mod tests {
         Some((dec, t))
     }
 
+    /// Keys plus, when tmux is installed, a scratch server. The token is
+    /// checked before any tmux work, so authorization tests also run without
+    /// tmux: they get a socket path that does not exist and skip only their
+    /// tmux-state assertions.
+    fn auth_setup(first_session: &str) -> Option<(DecodingKey, Option<ScratchTmux>, PathBuf)> {
+        let Some((_, dec)) = test_support::keys() else {
+            eprintln!("skipping: openssl unavailable");
+            return None;
+        };
+        let t = ScratchTmux::start(first_session);
+        let socket = match &t {
+            Some(t) => t.socket().to_path_buf(),
+            None => {
+                eprintln!("/usr/bin/tmux not available: checking replies, not tmux state");
+                std::env::temp_dir().join("tmuxwrapper-test-auth-no-such-socket")
+            }
+        };
+        Some((dec, t, socket))
+    }
+
     fn requests(token: &str, name: &str) -> Vec<Request> {
         vec![
             Request::Open {
@@ -357,10 +377,10 @@ mod tests {
 
     #[tokio::test]
     async fn forged_expired_wrong_audience_and_wrong_user_tokens_are_unauthorized() {
-        let Some((dec, t)) = setup("base") else {
+        let Some((dec, t, socket)) = auth_setup("base") else {
             return;
         };
-        let c = ctx(vec![dec], t.socket(), 5);
+        let c = ctx(vec![dec], &socket, 5);
         let bad_tokens = [
             ("other key", token_signed_by_other_key().unwrap()),
             (
@@ -400,15 +420,17 @@ mod tests {
                 assert!(fd.is_none(), "{desc}: PTY fd returned");
             }
         }
-        assert_eq!(session_names(t.socket()).await, vec!["base".to_string()]);
+        if let Some(t) = t {
+            assert_eq!(session_names(t.socket()).await, vec!["base".to_string()]);
+        }
     }
 
     #[tokio::test]
     async fn bad_token_with_bad_name_is_unauthorized_not_bad_request() {
-        let Some((dec, t)) = setup("base") else {
+        let Some((dec, _t, socket)) = auth_setup("base") else {
             return;
         };
-        let c = ctx(vec![dec], t.socket(), 5);
+        let c = ctx(vec![dec], &socket, 5);
         let tok = test_support::mint(EMAIL, AUD, ISS, now() - 3600).unwrap();
         for name in ["", "../etc", "a;b"] {
             for req in requests(&tok, name) {
@@ -424,10 +446,10 @@ mod tests {
 
     #[tokio::test]
     async fn no_keys_loaded_is_refused_for_every_request() {
-        let Some((_, t)) = setup("base") else {
+        let Some((_, t, socket)) = auth_setup("base") else {
             return;
         };
-        let c = ctx(vec![], t.socket(), 5);
+        let c = ctx(vec![], &socket, 5);
         for req in requests(&good_token(), "fresh") {
             let (resp, fd) = handle(&c, req).await;
             assert_eq!(
@@ -438,7 +460,9 @@ mod tests {
             );
             assert!(fd.is_none());
         }
-        assert_eq!(session_names(t.socket()).await, vec!["base".to_string()]);
+        if let Some(t) = t {
+            assert_eq!(session_names(t.socket()).await, vec!["base".to_string()]);
+        }
     }
 
     #[tokio::test]
