@@ -124,13 +124,18 @@ impl Config {
         }
 
         if let Some(url) = &cf.jwks_url {
-            // Loopback host must end at a port or path, so that
-            // "http://127.0.0.1.evil.example" is not accepted.
-            let loopback = ["http://127.0.0.1", "http://localhost"].iter().any(|p| {
-                url.strip_prefix(p)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
+            let ok = reqwest::Url::parse(url).is_ok_and(|u| {
+                u.username().is_empty()
+                    && u.password().is_none()
+                    && match u.scheme() {
+                        "https" => u.host_str().is_some(),
+                        "http" => matches!(
+                            u.host_str(),
+                            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+                        ),
+                        _ => false,
+                    }
             });
-            let ok = url.starts_with("https://") || loopback;
             if !ok {
                 return Err(format!(
                     "cloudflare.jwks_url '{url}' must be https:// or loopback http://"
@@ -383,6 +388,7 @@ tmux_session = "main"
             "https://keys.example/certs",
             "http://127.0.0.1:8799/certs",
             "http://localhost:8799/certs",
+            "http://[::1]:8799/certs",
         ] {
             assert!(Config::from_toml_str(&with_jwks_url(url)).is_ok(), "{url}");
         }
@@ -395,6 +401,9 @@ tmux_session = "main"
             "ftp://127.0.0.1/certs",
             "http://127.0.0.1.evil.example/certs",
             "http://localhost.evil.example/certs",
+            "http://127.0.0.1:80@evil.example/",
+            "http://localhost:1@evil.example/",
+            "https://user@keys.example/certs",
         ] {
             let err = Config::from_toml_str(&with_jwks_url(url))
                 .unwrap_err()
