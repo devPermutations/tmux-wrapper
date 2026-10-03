@@ -1,8 +1,5 @@
-// Called by the helper (Task 4).
-#![allow(dead_code)]
-
 //! tmux operations, run as the current process user (the helper runs as the
-//! target user, so there is no sudo). `socket: Option<&Path>` adds `-S <path>`
+//! target user, so nothing switches users). `socket: Option<&Path>` adds `-S <path>`
 //! so tests can use a scratch server; production passes `None`.
 
 use crate::proto::SessionInfo;
@@ -30,7 +27,7 @@ pub fn refuses_new_session(existing: &[String], requested: &str, cap: usize) -> 
 pub enum TmuxServer {
     Running(Vec<String>),
     NotRunning,
-    /// The listing failed for some other reason (e.g. sudo misconfigured).
+    /// The listing failed for some other reason (e.g. permission denied).
     Unknown,
 }
 
@@ -230,8 +227,11 @@ mod tests {
             classify_list_sessions(false, "", denied),
             TmuxServer::Unknown
         );
-        let sudo = "sudo: unknown user ghost\n";
-        assert_eq!(classify_list_sessions(false, "", sudo), TmuxServer::Unknown);
+        let other = "tmux: unknown failure\n";
+        assert_eq!(
+            classify_list_sessions(false, "", other),
+            TmuxServer::Unknown
+        );
     }
 
     #[tokio::test]

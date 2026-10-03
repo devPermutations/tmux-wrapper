@@ -1,6 +1,3 @@
-// Used by the helper and helper client (Tasks 4–5).
-#![allow(dead_code)]
-
 //! Wire protocol between the unprivileged front and the per-user helper.
 //!
 //! One JSON message per `SOCK_SEQPACKET` datagram. `Response::Opened` is
@@ -17,7 +14,7 @@ use std::io::{self, IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use tokio::io::unix::AsyncFd;
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Open { token: String, session: String },
@@ -157,11 +154,13 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
 }
 
 /// Blocking send of one message, optionally with one fd.
+#[allow(dead_code)] // Blocking variant: only tests use it so far.
 pub fn send<T: Serialize>(sock: BorrowedFd, msg: &T, fd: Option<BorrowedFd>) -> io::Result<()> {
     send_bytes(sock, &encode(msg)?, fd)
 }
 
 /// Blocking receive of one message and its optional fd.
+#[allow(dead_code)] // Blocking variant: only tests use it so far.
 pub fn recv<T: DeserializeOwned>(sock: BorrowedFd) -> io::Result<(T, Option<OwnedFd>)> {
     let (bytes, fd) = recv_bytes(sock)?;
     Ok((decode(&bytes)?, fd))

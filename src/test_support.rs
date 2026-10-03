@@ -52,8 +52,6 @@ fn generate() -> Option<(String, String)> {
 }
 
 static PRIMARY: OnceLock<Option<(String, String)>> = OnceLock::new();
-// `other_keys` is first used by later tasks.
-#[allow(dead_code)]
 static OTHER: OnceLock<Option<(String, String)>> = OnceLock::new();
 
 /// The primary test key pair; `None` if `openssl` is unavailable.
@@ -62,7 +60,6 @@ pub fn keys() -> Option<(EncodingKey, DecodingKey)> {
 }
 
 /// A second, different key pair, for "signed by the wrong key" tests.
-#[allow(dead_code)]
 pub fn other_keys() -> Option<(EncodingKey, DecodingKey)> {
     pair(OTHER.get_or_init(generate))
 }

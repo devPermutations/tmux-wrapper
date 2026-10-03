@@ -2,11 +2,13 @@ use crate::config::UserConfig;
 use nix::unistd::{Gid, Uid, User};
 
 pub struct ResolvedUser {
+    #[allow(dead_code)] // Used by the privilege drop (Task 6).
     pub uid: Uid,
+    #[allow(dead_code)] // Used by the privilege drop (Task 6).
     pub gid: Gid,
     pub home: String,
+    #[allow(dead_code)] // Used for the helper's environment (Task 6).
     pub shell: String,
-    pub tmux_session: String,
 }
 
 impl ResolvedUser {
@@ -20,7 +22,6 @@ impl ResolvedUser {
             gid: user.gid,
             home: user.dir.to_string_lossy().into_owned(),
             shell: user.shell.to_string_lossy().into_owned(),
-            tmux_session: user_config.tmux_session.clone(),
         })
     }
 }

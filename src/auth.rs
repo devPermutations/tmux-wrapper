@@ -33,8 +33,6 @@ pub struct Claims {
 }
 
 /// True iff the verified token's email is this user's, ignoring ASCII case.
-// Wired into the privileged helper in a later task.
-#[allow(dead_code)]
 pub(crate) fn token_grants(user: &UserConfig, claims: &Claims) -> bool {
     claims.email.eq_ignore_ascii_case(&user.email)
 }

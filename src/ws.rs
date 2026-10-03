@@ -1,17 +1,17 @@
 use crate::auth::{JwksCache, until_expiry};
 use crate::config::{Config, UserConfig};
+use crate::helper_client::{HelperClient, HelperDead};
+use crate::proto::{Request, Response as HelperResponse};
 use crate::pty::PtyMaster;
-use crate::tmux::{TmuxServer, classify_list_sessions, is_valid_session_name, refuses_new_session};
-use crate::user::ResolvedUser;
+use crate::tmux::is_valid_session_name;
 use axum::Json;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use nix::libc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
@@ -32,6 +32,12 @@ const CLOSE_CODE_SESSION_EXPIRED: u16 = 4001;
 /// surfaced verbatim by the frontend.
 const CLOSE_CODE_REFUSED: u16 = 4004;
 
+/// Close reason sent with `CLOSE_CODE_SESSION_EXPIRED`.
+const SESSION_EXPIRED: &str = "session expired";
+
+/// Refusal reason when the helper could not hand over a usable terminal.
+const OPEN_FAILED: &str = "could not start terminal";
+
 /// Mask email for logging: "user@example.com" → "us***@example.com"
 fn mask_email(email: &str) -> String {
     match email.split_once('@') {
@@ -47,6 +53,8 @@ pub struct AppState {
     pub config: Config,
     pub jwks: JwksCache,
     pub sessions: Mutex<HashMap<String, usize>>,
+    /// One helper per configured user, keyed by `unix_user`.
+    pub helpers: HashMap<String, HelperClient>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,13 +70,6 @@ pub struct WsQuery {
     pub session: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TmuxSession {
-    name: String,
-    windows: u32,
-    attached: bool,
-}
-
 /// Authenticated identity derived from a verified Cloudflare Access JWT.
 struct AuthIdentity {
     /// Key used for session counting (the JWT email).
@@ -76,8 +77,9 @@ struct AuthIdentity {
     /// Display string for logs.
     display_name: String,
     user_config: UserConfig,
-    /// When the Access session lapses (JWT `exp`, unix seconds).
-    expires_at: u64,
+    /// The verified Access JWT, forwarded to the helper (which re-verifies
+    /// it). Never log it.
+    token: String,
 }
 
 /// Extract and verify the Cloudflare Access JWT, return identity on success.
@@ -117,8 +119,30 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthIdent
         display_name: mask_email(&claims.email),
         key: claims.email,
         user_config,
-        expires_at: claims.exp,
+        token,
     })
+}
+
+/// Send `req` to `unix_user`'s helper. `None` if no helper is configured for
+/// the user (a startup bug). A dead helper ends the process — retrying on the
+/// same socket could pair a late reply with the wrong request — and systemd
+/// restarts the service.
+async fn ask_helper(
+    state: &AppState,
+    unix_user: &str,
+    req: &Request,
+) -> Option<(HelperResponse, Option<OwnedFd>)> {
+    let Some(helper) = state.helpers.get(unix_user) else {
+        error!(unix_user = %unix_user, "no helper for this user");
+        return None;
+    };
+    match helper.request(req).await {
+        Ok(reply) => Some(reply),
+        Err(HelperDead) => {
+            error!(unix_user = %unix_user, "helper is dead or unresponsive — exiting");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// GET /api/sessions — list tmux sessions for the authenticated user
@@ -128,42 +152,20 @@ pub async fn sessions_handler(State(state): State<Arc<AppState>>, headers: Heade
         Err(status) => return status.into_response(),
     };
 
-    // Run `tmux list-sessions` as the target user
-    let output = tokio::process::Command::new("/usr/bin/sudo")
-        .args([
-            "-u",
-            &identity.user_config.unix_user,
-            "/usr/bin/tmux",
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_windows}\t#{session_attached}",
-        ])
-        .output()
-        .await;
-
-    let sessions: Vec<TmuxSession> = match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout
-                .lines()
-                .filter_map(|line| {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() >= 3 {
-                        Some(TmuxSession {
-                            name: parts[0].to_string(),
-                            windows: parts[1].parse().unwrap_or(0),
-                            attached: parts[2] != "0",
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
-        Err(_) => vec![],
+    let req = Request::List {
+        token: identity.token,
     };
+    let reply = ask_helper(&state, &identity.user_config.unix_user, &req).await;
+    list_response(reply.map(|(resp, _fd)| resp))
+}
 
-    Json(sessions).into_response()
+fn list_response(resp: Option<HelperResponse>) -> Response {
+    match resp {
+        Some(HelperResponse::Sessions { sessions }) => Json(sessions).into_response(),
+        Some(HelperResponse::Unauthorized) => StatusCode::UNAUTHORIZED.into_response(),
+        Some(HelperResponse::Refused { .. }) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// DELETE /api/sessions/:name — kill a tmux session
@@ -182,33 +184,33 @@ pub async fn kill_session_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let output = tokio::process::Command::new("/usr/bin/sudo")
-        .args([
-            "-u",
-            &identity.user_config.unix_user,
-            "/usr/bin/tmux",
-            "kill-session",
-            "-t",
-            &name,
-        ])
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            info!(user = %identity.user_config.unix_user, session = %name, "killed tmux session");
-            StatusCode::OK.into_response()
+    let unix_user = identity.user_config.unix_user;
+    let req = Request::Kill {
+        token: identity.token,
+        name: name.clone(),
+    };
+    let resp = ask_helper(&state, &unix_user, &req).await.map(|(r, _fd)| r);
+    match &resp {
+        Some(HelperResponse::Killed) => {
+            info!(user = %unix_user, session = %name, "killed tmux session")
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            warn!(user = %identity.user_config.unix_user, session = %name, error = %stderr, "kill-session failed");
-            StatusCode::NOT_FOUND.into_response()
+        Some(HelperResponse::Refused { reason }) => {
+            warn!(user = %unix_user, session = %name, reason = %reason, "kill-session refused")
         }
-        Err(e) => {
-            error!(error = %e, "failed to run tmux kill-session");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        _ => {}
     }
+    kill_response(resp)
+}
+
+fn kill_response(resp: Option<HelperResponse>) -> Response {
+    match resp {
+        Some(HelperResponse::Killed) => StatusCode::OK,
+        Some(HelperResponse::NotFound) => StatusCode::NOT_FOUND,
+        Some(HelperResponse::BadRequest) => StatusCode::BAD_REQUEST,
+        Some(HelperResponse::Unauthorized) => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+    .into_response()
 }
 
 pub async fn ws_handler(
@@ -252,113 +254,37 @@ pub async fn ws_handler(
     }
 
     let state_clone = Arc::clone(&state);
-    ws.on_upgrade(move |socket| {
-        handle_socket(
-            socket,
-            state_clone,
-            identity.key,
-            identity.display_name,
-            identity.user_config,
-            session_name,
-            identity.expires_at,
-        )
-    })
-    .into_response()
+    ws.on_upgrade(move |socket| handle_socket(socket, state_clone, identity, session_name))
+        .into_response()
 }
 
-/// Refuse a freshly upgraded socket with a close frame the frontend surfaces.
-async fn refuse_socket(mut socket: WebSocket, reason: &str) {
+async fn close_socket(mut socket: WebSocket, code: u16, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
-            code: CLOSE_CODE_REFUSED,
+            code,
             reason: reason.into(),
         })))
         .await;
 }
 
-/// Ask the user's tmux server for its sessions.
-///
-/// `Unknown` fails open for the session cap so a broken listing can't lock
-/// users out, but warns — otherwise e.g. a sudo misconfiguration would
-/// silently disable the cap (PTY spawn doesn't go through sudo).
-async fn query_tmux_server(unix_user: &str) -> TmuxServer {
-    let output = tokio::process::Command::new("/usr/bin/sudo")
-        .args([
-            "-u",
-            unix_user,
-            "/usr/bin/tmux",
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ])
-        .output()
-        .await;
-    match output {
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let server = classify_list_sessions(
-                out.status.success(),
-                &String::from_utf8_lossy(&out.stdout),
-                &stderr,
-            );
-            if server == TmuxServer::Unknown {
-                warn!(
-                    unix_user = %unix_user,
-                    status = %out.status,
-                    stderr = %stderr.trim(),
-                    "tmux list-sessions failed — session cap not enforced for this connection"
-                );
-            }
-            server
-        }
-        Err(e) => {
-            warn!(
-                unix_user = %unix_user,
-                error = %e,
-                "failed to run tmux list-sessions — session cap not enforced for this connection"
-            );
-            TmuxServer::Unknown
-        }
-    }
-}
-
-/// Start the user's `tmux-server.service` (D-012), so a server that exited —
-/// e.g. after the last session was killed from the picker — comes back in
-/// its clean systemd context rather than inside this sandboxed service.
-async fn start_tmux_server_unit(unix_user: &str) {
-    let machine = format!("{unix_user}@");
-    let output = tokio::process::Command::new("/usr/bin/systemctl")
-        .args(["--user", "-M", &machine, "start", "tmux-server.service"])
-        .output()
-        .await;
-    match output {
-        Ok(out) if out.status.success() => {
-            info!(unix_user = %unix_user, "started tmux-server.service");
-        }
-        Ok(out) => warn!(
-            unix_user = %unix_user,
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "could not start tmux-server.service"
-        ),
-        Err(e) => warn!(unix_user = %unix_user, error = %e, "failed to run systemctl"),
-    }
+/// Refuse a freshly upgraded socket with a close frame the frontend surfaces.
+async fn refuse_socket(socket: WebSocket, reason: &str) {
+    close_socket(socket, CLOSE_CODE_REFUSED, reason).await;
 }
 
 async fn handle_socket(
     socket: WebSocket,
     state: Arc<AppState>,
-    session_key: String,
-    display_name: String,
-    user_config: UserConfig,
+    identity: AuthIdentity,
     session_name: Option<String>,
-    expires_at: u64,
 ) {
+    let key = identity.key.clone();
     // Atomic check + increment of the per-user WebSocket connection count
     {
         let mut sessions = state.sessions.lock().await;
-        let count = sessions.get(&session_key).copied().unwrap_or(0);
+        let count = sessions.get(&key).copied().unwrap_or(0);
         if count >= MAX_CONCURRENT_CONNECTIONS_PER_USER {
-            warn!(user = %display_name, count, "connection limit reached");
+            warn!(user = %identity.display_name, count, "connection limit reached");
             refuse_socket(
                 socket,
                 "connection limit reached — close another terminal tab first",
@@ -366,99 +292,110 @@ async fn handle_socket(
             .await;
             return;
         }
-        *sessions.entry(session_key.clone()).or_insert(0) += 1;
+        *sessions.entry(key.clone()).or_insert(0) += 1;
     }
+    open_terminal(socket, &state, identity, session_name).await;
+    decrement_session(&state, &key).await;
+}
 
-    // Resolve unix user
-    let mut resolved = match ResolvedUser::from_config(&user_config) {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, "user resolution failed");
-            decrement_session(&state, &session_key).await;
-            return;
+/// What to do with an upgraded socket, given the helper's reply to `Open`.
+#[derive(Debug)]
+enum OpenOutcome {
+    Bridge { fd: OwnedFd, expires_in: Duration },
+    Close { code: u16, reason: String },
+}
+
+impl OpenOutcome {
+    fn refused(reason: &str) -> Self {
+        OpenOutcome::Close {
+            code: CLOSE_CODE_REFUSED,
+            reason: reason.into(),
         }
-    };
-
-    // Override session name if provided in query
-    if let Some(name) = session_name {
-        resolved.tmux_session = name;
     }
 
-    // Never let `tmux new-session` start a server here: it would inherit this
-    // service's sandbox (read-only /, root's cgroup) — the D-012 failure.
-    let mut server = query_tmux_server(&user_config.unix_user).await;
-    if server == TmuxServer::NotRunning {
-        start_tmux_server_unit(&user_config.unix_user).await;
-        server = query_tmux_server(&user_config.unix_user).await;
-    }
-    let existing = match server {
-        TmuxServer::Running(names) => names,
-        TmuxServer::Unknown => Vec::new(),
-        TmuxServer::NotRunning => {
-            warn!(user = %display_name, "no tmux server and tmux-server.service didn't start one");
-            refuse_socket(
-                socket,
-                "tmux server isn't running — start tmux-server.service",
-            )
-            .await;
-            decrement_session(&state, &session_key).await;
-            return;
+    fn expired() -> Self {
+        OpenOutcome::Close {
+            code: CLOSE_CODE_SESSION_EXPIRED,
+            reason: SESSION_EXPIRED.into(),
         }
-    };
-
-    // Real tmux-session cap: spawning a NEW session name is refused past the
-    // limit; attaching to an existing session is always allowed.
-    if refuses_new_session(
-        &existing,
-        &resolved.tmux_session,
-        state.config.terminal.max_sessions_per_user,
-    ) {
-        warn!(
-            user = %display_name,
-            session = %resolved.tmux_session,
-            existing = existing.len(),
-            "tmux session limit reached"
-        );
-        refuse_socket(socket, "session limit reached — kill an old session first").await;
-        decrement_session(&state, &session_key).await;
-        return;
     }
+}
 
-    info!(
-        user = %display_name,
-        unix_user = %user_config.unix_user,
-        session = %resolved.tmux_session,
-        "spawning PTY"
-    );
-
-    // Spawn PTY with tmux
-    let pty = match PtyMaster::spawn(&resolved) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(error = %e, "PTY spawn failed");
-            decrement_session(&state, &session_key).await;
-            return;
+/// Decide from the helper's reply (`None`: no helper for the user) and the
+/// current time (unix seconds). A stray fd on a non-`Opened` reply is closed.
+fn open_outcome(reply: Option<(HelperResponse, Option<OwnedFd>)>, now: u64) -> OpenOutcome {
+    match reply {
+        Some((HelperResponse::Opened { expires_at }, Some(fd))) => {
+            let expires_in = until_expiry(expires_at, now);
+            if expires_in.is_zero() {
+                // Accepted within the verifier's leeway but already past `exp`.
+                OpenOutcome::expired()
+            } else {
+                OpenOutcome::Bridge { fd, expires_in }
+            }
         }
-    };
+        Some((HelperResponse::Refused { reason }, _)) => OpenOutcome::refused(&reason),
+        Some((HelperResponse::Unauthorized, _)) => OpenOutcome::expired(),
+        // `Opened` without its fd is a protocol error; nothing else is a
+        // valid answer to `Open`.
+        Some(_) | None => OpenOutcome::refused(OPEN_FAILED),
+    }
+}
 
-    let session_label = resolved.tmux_session.clone();
+/// Ask the helper for a terminal and bridge it to the socket until either
+/// side ends or the Access session lapses.
+async fn open_terminal(
+    socket: WebSocket,
+    state: &AppState,
+    identity: AuthIdentity,
+    session_name: Option<String>,
+) {
+    let user = identity.display_name;
+    let unix_user = identity.user_config.unix_user;
+    let session = session_name.unwrap_or(identity.user_config.tmux_session);
+    info!(user = %user, unix_user = %unix_user, session = %session, "opening terminal");
+
+    let req = Request::Open {
+        token: identity.token,
+        session: session.clone(),
+    };
+    let reply = ask_helper(state, &unix_user, &req).await;
+    if let Some((resp, fd)) = &reply
+        && !matches!(resp, HelperResponse::Opened { .. } if fd.is_some())
+    {
+        warn!(user = %user, session = %session, reply = ?resp, has_fd = fd.is_some(), "terminal not opened");
+    }
     // Authentication happens once, at upgrade; without a deadline a socket
     // would outlive the Access session indefinitely (pings keep it alive).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(u64::MAX);
+    let (fd, expires_in) = match open_outcome(reply, now) {
+        OpenOutcome::Bridge { fd, expires_in } => (fd, expires_in),
+        OpenOutcome::Close { code, reason } => {
+            close_socket(socket, code, &reason).await;
+            return;
+        }
+    };
+    let pty = match PtyMaster::from_fd(fd) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(error = %e, "could not use the PTY from the helper");
+            refuse_socket(socket, OPEN_FAILED).await;
+            return;
+        }
+    };
     run_bridge(
         socket,
         pty,
         state.config.terminal.ping_interval_secs,
-        until_expiry(expires_at, now),
-        &display_name,
-        &session_label,
+        expires_in,
+        &user,
+        &session,
     )
     .await;
-    decrement_session(&state, &session_key).await;
-    info!(user = %display_name, "session ended");
+    info!(user = %user, "session ended");
 }
 
 async fn decrement_session(state: &AppState, key: &str) {
@@ -469,16 +406,6 @@ async fn decrement_session(state: &AppState, key: &str) {
             sessions.remove(key);
         }
     }
-}
-
-fn pty_resize(fd: &OwnedFd, cols: u16, rows: u16) {
-    let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 }
 
 // Binary WebSocket protocol:
@@ -500,10 +427,11 @@ async fn run_bridge(
 ) {
     let user = user.to_string();
     let session = session.to_string();
-    // dup() the PTY fd for resize ioctls — owns its own fd independently
-    // so there's no use-after-close if the PtyMaster is dropped first.
-    let resize_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(pty.raw_fd()) }).ok();
-    let (mut pty_read, mut pty_write) = tokio::io::split(pty);
+    // Shared by the reader and writer tasks; the master closes (hanging up the
+    // tmux client) once both have been dropped.
+    let pty = Arc::new(pty);
+    let pty_reader = Arc::clone(&pty);
+    let pty_writer = pty;
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(16);
     let (ws_in_tx, mut ws_in_rx) = mpsc::channel::<WsInput>(16);
 
@@ -521,7 +449,7 @@ async fn run_bridge(
                     let _ = socket
                         .send(Message::Close(Some(CloseFrame {
                             code: CLOSE_CODE_SESSION_EXPIRED,
-                            reason: "session expired".into(),
+                            reason: SESSION_EXPIRED.into(),
                         })))
                         .await;
                     break;
@@ -586,6 +514,7 @@ async fn run_bridge(
     let ws_out_tx_clone = ws_out_tx.clone();
     let mut pty_to_ws = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
+        let mut pty_read = &*pty_reader;
         loop {
             match pty_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -611,6 +540,7 @@ async fn run_bridge(
 
     // Task 3: WebSocket → PTY
     let mut ws_to_pty = tokio::spawn(async move {
+        let mut pty_write = &*pty_writer;
         while let Some(input) = ws_in_rx.recv().await {
             match input {
                 WsInput::Data(data) => {
@@ -619,11 +549,7 @@ async fn run_bridge(
                         break;
                     }
                 }
-                WsInput::Resize(cols, rows) => {
-                    if let Some(ref fd) = resize_fd {
-                        pty_resize(fd, cols, rows);
-                    }
-                }
+                WsInput::Resize(cols, rows) => pty_write.resize(cols, rows),
                 WsInput::Close => break,
             }
         }
@@ -644,12 +570,178 @@ async fn run_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::mask_email;
+    use super::*;
+    use crate::proto::SessionInfo;
 
     #[test]
     fn mask_email_hides_local_part() {
         assert_eq!(mask_email("user@example.com"), "us***@example.com");
         assert_eq!(mask_email("ab@example.com"), "ab***@example.com");
         assert_eq!(mask_email("not-an-email"), "***");
+    }
+
+    fn some_fd() -> OwnedFd {
+        std::fs::File::open("/dev/null").unwrap().into()
+    }
+
+    fn refused(reason: &str) -> HelperResponse {
+        HelperResponse::Refused {
+            reason: reason.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_reply_is_the_same_json_shape_as_before() {
+        let resp = list_response(Some(HelperResponse::Sessions {
+            sessions: vec![SessionInfo {
+                name: "main".into(),
+                windows: 2,
+                attached: true,
+            }],
+        }));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!([{"name": "main", "windows": 2, "attached": true}])
+        );
+    }
+
+    #[test]
+    fn list_statuses() {
+        let status = |r| list_response(r).status();
+        assert_eq!(
+            status(Some(HelperResponse::Unauthorized)),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(Some(refused("auth keys unavailable — try again shortly"))),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        for other in [HelperResponse::Killed, HelperResponse::BadRequest] {
+            assert_eq!(status(Some(other)), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        assert_eq!(status(None), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn kill_statuses() {
+        let status = |r| kill_response(r).status();
+        assert_eq!(status(Some(HelperResponse::Killed)), StatusCode::OK);
+        assert_eq!(
+            status(Some(HelperResponse::NotFound)),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(Some(HelperResponse::BadRequest)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(Some(HelperResponse::Unauthorized)),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(Some(refused("could not kill session"))),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(Some(HelperResponse::Sessions { sessions: vec![] })),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(status(None), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn close_of(outcome: OpenOutcome) -> (u16, String) {
+        match outcome {
+            OpenOutcome::Close { code, reason } => (code, reason),
+            OpenOutcome::Bridge { .. } => panic!("expected a close, got a bridge"),
+        }
+    }
+
+    #[test]
+    fn opened_with_fd_bridges_until_expiry() {
+        let reply = (HelperResponse::Opened { expires_at: 1300 }, Some(some_fd()));
+        match open_outcome(Some(reply), 1000) {
+            OpenOutcome::Bridge { expires_in, .. } => {
+                assert_eq!(expires_in, Duration::from_secs(300))
+            }
+            other => panic!("expected a bridge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opened_at_or_past_expiry_closes_as_expired() {
+        for expires_at in [1000, 990] {
+            let reply = (HelperResponse::Opened { expires_at }, Some(some_fd()));
+            assert_eq!(
+                close_of(open_outcome(Some(reply), 1000)),
+                (4001, "session expired".to_string()),
+                "expires_at {expires_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_refusals_and_failures_close_the_socket() {
+        let limit = "session limit reached — kill an old session first";
+        let no_server = "tmux server isn't running — start tmux-server.service";
+        let failed = (4004, "could not start terminal".to_string());
+        let cases = [
+            (Some((refused(limit), None)), (4004, limit.to_string())),
+            (
+                Some((refused(no_server), None)),
+                (4004, no_server.to_string()),
+            ),
+            // A stray fd on a refusal is ignored (and closed).
+            (
+                Some((refused(limit), Some(some_fd()))),
+                (4004, limit.to_string()),
+            ),
+            (
+                Some((HelperResponse::Unauthorized, None)),
+                (4001, "session expired".to_string()),
+            ),
+            (
+                Some((
+                    HelperResponse::Opened {
+                        expires_at: u64::MAX,
+                    },
+                    None,
+                )),
+                failed.clone(),
+            ),
+            (Some((HelperResponse::BadRequest, None)), failed.clone()),
+            (Some((HelperResponse::Killed, None)), failed.clone()),
+            (None, failed.clone()),
+        ];
+        for (reply, want) in cases {
+            let desc = format!("{:?}", reply.as_ref().map(|(r, fd)| (r, fd.is_some())));
+            assert_eq!(close_of(open_outcome(reply, 1000)), want, "{desc}");
+        }
+    }
+
+    /// Nothing in `src/` shells out to switch users any more (the helper
+    /// already runs as the user), and `pty.rs` no longer forks or calls
+    /// setuid itself.
+    #[test]
+    fn no_user_switching_command_in_src_and_no_fork_in_pty() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Built at runtime so this file doesn't match itself.
+        let needle = ["su", "do"].concat();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains(&needle),
+                "{} mentions {needle}",
+                path.display()
+            );
+        }
+        let pty = std::fs::read_to_string(src.join("pty.rs")).unwrap();
+        for word in [["fo", "rk("].concat(), ["set", "uid"].concat()] {
+            assert!(!pty.contains(&word), "pty.rs contains {word}");
+        }
     }
 }

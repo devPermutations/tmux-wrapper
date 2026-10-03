@@ -1,6 +1,3 @@
-// Started by main after the privilege drop (Task 6).
-#![allow(dead_code)]
-
 //! The per-user helper: runs as the target unix user and is the security
 //! boundary. Every request carries the original Cloudflare Access token, which
 //! is re-verified against the helper's own JWKS before anything else happens,
@@ -195,6 +192,7 @@ pub async fn serve(ctx: HelperCtx, sock: AsyncSeqpacket) {
 /// Process entrypoint for the helper after the privilege drop. Builds its
 /// own current-thread runtime, fetches its own JWKS, serves the front over
 /// `sock`, and exits 0 when the front goes away.
+#[allow(dead_code)] // Called by main after the fork (Task 6).
 pub fn run_helper(
     sock: OwnedFd,
     user: UserConfig,
