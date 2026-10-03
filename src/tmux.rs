@@ -5,6 +5,8 @@
 use crate::proto::SessionInfo;
 use std::io;
 use std::path::Path;
+use std::process::Output;
+use std::time::Duration;
 use tokio::process::Command;
 
 const TMUX: &str = "/usr/bin/tmux";
@@ -46,6 +48,23 @@ pub fn classify_list_sessions(success: bool, stdout: &str, stderr: &str) -> Tmux
     }
 }
 
+/// Every tmux / systemctl call gives up after this, so a hung tmux makes the
+/// helper answer (Refused, or an empty list) well inside the front's 10 s
+/// `HelperDead` timeout instead of stalling it into a restart.
+pub(crate) const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `cmd` to completion, or kill it and fail with `TimedOut` after `limit`.
+async fn output_within(mut cmd: Command, limit: Duration) -> io::Result<Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(output) => output,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("subprocess did not finish within {limit:?}"),
+        )),
+    }
+}
+
 fn tmux_command(socket: Option<&Path>) -> Command {
     let mut cmd = Command::new(TMUX);
     if let Some(sock) = socket {
@@ -57,17 +76,18 @@ fn tmux_command(socket: Option<&Path>) -> Command {
 
 /// Ask tmux whether the user's server is up and which sessions it has.
 pub async fn query_server(socket: Option<&Path>) -> TmuxServer {
-    let output = tmux_command(socket)
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .await;
-    match output {
+    let mut cmd = tmux_command(socket);
+    cmd.args(["list-sessions", "-F", "#{session_name}"]);
+    match output_within(cmd, SUBPROCESS_TIMEOUT).await {
         Ok(out) => classify_list_sessions(
             out.status.success(),
             &String::from_utf8_lossy(&out.stdout),
             &String::from_utf8_lossy(&out.stderr),
         ),
-        Err(_) => TmuxServer::Unknown,
+        Err(e) => {
+            tracing::warn!(error = %e, "tmux list-sessions failed");
+            TmuxServer::Unknown
+        }
     }
 }
 
@@ -75,11 +95,9 @@ pub async fn query_server(socket: Option<&Path>) -> TmuxServer {
 /// comes back in its clean systemd context. Relies on `XDG_RUNTIME_DIR` and
 /// `DBUS_SESSION_BUS_ADDRESS` being set by the helper.
 pub async fn start_server_unit() {
-    let output = Command::new("/usr/bin/systemctl")
-        .args(["--user", "start", "tmux-server.service"])
-        .output()
-        .await;
-    match output {
+    let mut cmd = Command::new("/usr/bin/systemctl");
+    cmd.args(["--user", "start", "tmux-server.service"]);
+    match output_within(cmd, SUBPROCESS_TIMEOUT).await {
         Ok(out) if out.status.success() => tracing::info!("started tmux-server.service"),
         Ok(out) => tracing::warn!(
             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
@@ -110,27 +128,33 @@ fn parse_sessions(stdout: &str) -> Vec<SessionInfo> {
 
 /// The user's sessions; empty when there is no server or tmux fails.
 pub async fn list_sessions(socket: Option<&Path>) -> Vec<SessionInfo> {
-    let output = tmux_command(socket)
-        .args([
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_windows}\t#{session_attached}",
-        ])
-        .output()
-        .await;
-    match output {
+    let mut cmd = tmux_command(socket);
+    cmd.args([
+        "list-sessions",
+        "-F",
+        "#{session_name}\t#{session_windows}\t#{session_attached}",
+    ]);
+    match output_within(cmd, SUBPROCESS_TIMEOUT).await {
         Ok(out) if out.status.success() => parse_sessions(&String::from_utf8_lossy(&out.stdout)),
-        _ => Vec::new(),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if classify_list_sessions(false, "", &stderr) != TmuxServer::NotRunning {
+                tracing::warn!(stderr = %stderr.trim(), "tmux list-sessions failed");
+            }
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "tmux list-sessions failed");
+            Vec::new()
+        }
     }
 }
 
 /// Kill a session by exact name. `Ok(false)` means it (or the server) was not found.
 pub async fn kill_session(name: &str, socket: Option<&Path>) -> io::Result<bool> {
-    let out = tmux_command(socket)
-        .args(["kill-session", "-t"])
-        .arg(format!("={name}"))
-        .output()
-        .await?;
+    let mut cmd = tmux_command(socket);
+    cmd.args(["kill-session", "-t"]).arg(format!("={name}"));
+    let out = output_within(cmd, SUBPROCESS_TIMEOUT).await?;
     if out.status.success() {
         return Ok(true);
     }
@@ -268,6 +292,72 @@ mod tests {
         assert_eq!(query_server(Some(&sock)).await, TmuxServer::NotRunning);
         assert!(list_sessions(Some(&sock)).await.is_empty());
         assert!(!kill_session("x", Some(&sock)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_subprocess_past_its_timeout_is_killed_and_reported() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = output_within(cmd, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_subprocess_within_its_timeout_returns_its_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo hi"]);
+        let out = output_within(cmd, Duration::from_secs(5)).await.unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"hi\n");
+    }
+
+    /// A tmux server that never answers (SIGSTOPped) must not stall the
+    /// helper: every operation gives up after the subprocess timeout.
+    #[tokio::test]
+    async fn a_hung_tmux_server_times_out_instead_of_stalling() {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let Some(t) = ScratchTmux::start("base") else {
+            eprintln!("skipping: /usr/bin/tmux not available");
+            return;
+        };
+        let out = std::process::Command::new(TMUX)
+            .env_remove("TMUX")
+            .arg("-S")
+            .arg(t.socket())
+            .args(["display-message", "-p", "#{pid}"])
+            .output()
+            .unwrap();
+        let pid = Pid::from_raw(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap());
+        /// Resumes the server before `t` drops (kill-server would hang).
+        struct Resume(Pid);
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                let _ = kill(self.0, Signal::SIGCONT);
+            }
+        }
+        kill(pid, Signal::SIGSTOP).unwrap();
+        let _resume = Resume(pid);
+
+        let sock = Some(t.socket());
+        let started = std::time::Instant::now();
+        let (server, sessions, killed) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(
+                query_server(sock),
+                list_sessions(sock),
+                kill_session("base", sock)
+            )
+        })
+        .await
+        .expect("tmux operations stalled on a hung server");
+        assert_eq!(server, TmuxServer::Unknown);
+        assert!(sessions.is_empty());
+        assert!(killed.is_err());
+        assert!(started.elapsed() >= SUBPROCESS_TIMEOUT);
     }
 
     #[test]
