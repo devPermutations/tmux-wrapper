@@ -135,6 +135,14 @@ start_unit() {
   return 1
 }
 
+start_unit_or_die() {
+  if ! start_unit; then
+    echo "--- unit failed to come up; last journal lines:"
+    sudo -n journalctl -u "$UNIT" -n 20 --no-pager
+    die "unit did not come up on $ADDR"
+  fi
+}
+
 main_pid() { systemctl show -p MainPID --value "$UNIT.service"; }
 helper_pid() {
   local m="$1" p
@@ -154,11 +162,7 @@ wait_gone() { # pid seconds
 }
 
 echo "--- start unit"
-if ! start_unit; then
-  echo "--- unit failed to come up; last journal lines:"
-  sudo -n journalctl -u "$UNIT" -n 20 --no-pager
-  die "unit did not come up on $ADDR"
-fi
+start_unit_or_die
 pass "unit started and listening on $ADDR"
 
 echo "--- cargo e2e tests"
@@ -167,7 +171,7 @@ E2E_KEY_PEM="$KEY" E2E_URL="$ADDR" E2E_UNIT="$UNIT" \
 if [ $? -eq 0 ]; then pass "cargo e2e tests"; else fail "cargo e2e tests"; fi
 
 echo "--- helper death: kill -9 helper => main exits within 15 s"
-start_unit || die "unit restart failed"
+start_unit_or_die
 MAIN="$(main_pid)"
 HELPER="$(helper_pid "$MAIN")"
 if [ -z "$HELPER" ] || [ "${MAIN:-0}" -le 0 ]; then
@@ -183,7 +187,7 @@ else
 fi
 
 echo "--- front death: kill -9 front => helper gone within 5 s"
-start_unit || die "unit restart failed"
+start_unit_or_die
 MAIN="$(main_pid)"
 HELPER="$(helper_pid "$MAIN")"
 if [ -z "$HELPER" ] || [ "${MAIN:-0}" -le 0 ]; then

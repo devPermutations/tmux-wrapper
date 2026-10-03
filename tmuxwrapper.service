@@ -17,10 +17,10 @@ KillMode=process
 # sequenced before kill-server; see contrib/). A save here raced that kill
 # at reboot and clobbered `last` with a 0-byte file.
 
-# Starts as root, then drops privileges itself: a per-user helper setuids to
-# the target user, the front drops to run_as (default: tmuxwrapper).
-User=root
-Group=root
+# Runs as root (systemd's default) and drops privileges itself: a per-user
+# helper setuids to the target user, the front drops to run_as. Do NOT add an
+# explicit User=/Group=: combined with NoNewPrivileges + SystemCallFilter,
+# systemd then blocks the setuid/setresuid calls the privilege drop needs.
 
 # Hardening
 NoNewPrivileges=yes
