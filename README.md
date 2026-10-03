@@ -33,7 +33,7 @@ If you need local password auth or self-hosted TLS, this isn't the project for y
 - **Email → unix user** — the email in the access JWT maps to a real account on the box, isolated per user via setuid
 - **Tmux per user** — every session attaches to a named tmux session as the target unix user
 - **Session caps** — at most 5 WebSocket connections per user, and a configurable cap on distinct tmux sessions (`max_sessions_per_user`, default 5). Creating a session past the cap is refused with a visible message; attaching to an existing one always works
-- **Systemd-managed** — capability-bounded service; sessions are saved on stop via tmux-resurrect if it's installed, silently skipped if not
+- **Systemd-managed** — capability-bounded service that only *attaches*: each user's tmux server runs from their own `tmux-server.service` user unit (see `contrib/`), so panes never inherit the wrapper's sandbox. If a user's server is down (e.g. its last session was killed), the wrapper starts that unit; if it can't, the connection is refused with a visible message rather than starting a sandboxed server
 - **PWA-ready** — installable on iOS/Android, touch-friendly key bar, dictation support
 
 ## Quickstart
@@ -45,7 +45,18 @@ cargo build --release
 ./deploy.sh
 ```
 
-That installs the binary to `/opt/tmuxwrapper/`, copies static assets, and registers the systemd unit. Before starting, edit the config:
+That installs the binary to `/opt/tmuxwrapper/`, copies static assets, and registers the systemd unit. Re-running it upgrades in place: an existing `/opt/tmuxwrapper/config.toml` is kept and a running service is restarted.
+
+Each unix user in the config needs a tmux server running from a user unit:
+
+```bash
+cp contrib/tmux-server.service ~/.config/systemd/user/
+cp contrib/tmux-save-guarded ~/.local/bin/   # optional: guarded tmux-resurrect save on stop
+systemctl --user enable --now tmux-server.service
+sudo loginctl enable-linger "$USER"
+```
+
+On a first install, edit the config before starting:
 
 ```bash
 sudo nano /opt/tmuxwrapper/config.toml

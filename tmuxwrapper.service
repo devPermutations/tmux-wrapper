@@ -13,8 +13,9 @@ RestartSec=3
 # Only kill the main process, not forked tmux servers/shells
 KillMode=process
 
-# Best-effort tmux-resurrect save before stopping (no-op if not installed)
-ExecStop=/opt/tmuxwrapper/save-sessions.sh
+# Session saving lives in the user unit tmux-server.service (guarded,
+# sequenced before kill-server; see contrib/). A save here raced that kill
+# at reboot and clobbered `last` with a 0-byte file.
 
 # Needs root to setuid/setgid into target users
 User=root

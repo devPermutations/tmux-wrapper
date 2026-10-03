@@ -1,37 +1,42 @@
 #!/bin/bash
+# Install or upgrade tmuxwrapper under /opt. Safe to re-run: the live
+# config.toml is never overwritten, and a running service is restarted.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="/opt/tmuxwrapper"
 
-echo "==> Creating $DEST"
-sudo mkdir -p "$DEST/static/vendor"
+echo "==> Installing binary"
+sudo install -D -m 0755 "$SRC/target/release/tmuxwrapper" "$DEST/tmuxwrapper"
 
-echo "==> Copying binary"
-sudo cp "$SRC/target/release/tmuxwrapper" "$DEST/tmuxwrapper"
-sudo chmod +x "$DEST/tmuxwrapper"
+if sudo test -e "$DEST/config.toml"; then
+    echo "==> Keeping existing $DEST/config.toml"
+    fresh_config=0
+else
+    echo "==> Installing example config"
+    sudo install -m 0644 "$SRC/config.toml" "$DEST/config.toml"
+    fresh_config=1
+fi
 
-echo "==> Copying config"
-sudo cp "$SRC/config.toml" "$DEST/"
-
-echo "==> Copying static files"
-sudo cp "$SRC/static/"*.html "$SRC/static/"*.js "$SRC/static/"*.css "$SRC/static/"*.json "$SRC/static/"*.png "$DEST/static/"
-sudo cp "$SRC/static/vendor/"* "$DEST/static/vendor/"
-
-echo "==> Installing session-save helper"
-sudo cp "$SRC/save-sessions.sh" "$DEST/save-sessions.sh"
-sudo chmod +x "$DEST/save-sessions.sh"
+echo "==> Syncing static files"
+sudo rsync -a --delete "$SRC/static/" "$DEST/static/"
 
 echo "==> Installing systemd service"
-sudo cp "$SRC/tmuxwrapper.service" /etc/systemd/system/
+sudo install -m 0644 "$SRC/tmuxwrapper.service" /etc/systemd/system/tmuxwrapper.service
 sudo systemctl daemon-reload
 sudo systemctl enable tmuxwrapper
 
-echo ""
-echo "==> Deployed! Before starting, edit the config:"
-echo "    sudo nano $DEST/config.toml"
-echo "    (set cloudflare.audience to your CF Access AUD tag)"
-echo ""
-echo "    Then start with:"
-echo "    sudo systemctl start tmuxwrapper"
-echo "    sudo systemctl status tmuxwrapper"
+if [ "$fresh_config" = 1 ]; then
+    echo ""
+    echo "==> Installed. Before starting, edit the config:"
+    echo "    sudo nano $DEST/config.toml"
+    echo "    (set cloudflare.audience to your CF Access AUD tag)"
+    echo ""
+    echo "    Then: sudo systemctl start tmuxwrapper"
+elif systemctl is-active --quiet tmuxwrapper; then
+    echo "==> Restarting tmuxwrapper"
+    sudo systemctl restart tmuxwrapper
+    systemctl is-active tmuxwrapper
+else
+    echo "==> Upgraded. Start with: sudo systemctl start tmuxwrapper"
+fi
