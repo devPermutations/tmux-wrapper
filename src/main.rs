@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod helper;
 mod helper_client;
+mod privdrop;
 mod proto;
 mod pty;
 #[cfg(test)]
@@ -11,51 +12,184 @@ mod user;
 mod ws;
 
 use crate::auth::JwksCache;
-use crate::config::{CloudflareConfig, Config, UserConfig};
-use crate::helper::HelperCtx;
+use crate::config::{Config, UserConfig};
+use crate::helper::run_helper;
 use crate::helper_client::HelperClient;
-use crate::proto::{AsyncSeqpacket, seqpacket_pair};
+use crate::privdrop::drop_privileges;
+use crate::proto::seqpacket_pair;
 use crate::user::ResolvedUser;
 use crate::ws::{AppState, kill_session_handler, sessions_handler, ws_handler};
 use axum::Router;
 use axum::routing::{delete, get};
+use nix::sys::prctl;
+use nix::sys::signal::Signal;
+use nix::unistd::{ForkResult, Pid, fork, geteuid, getpid, getppid};
 use std::collections::HashMap;
-use std::path::Path;
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tracing::info;
+use tracing::{error, info, warn};
 
-#[tokio::main]
-async fn main() {
+/// Startup runs as root on a single thread: resolve users, fork one helper
+/// per user (each drops to that user), drop the front to `run_as`, and only
+/// then start the tokio runtime. Nothing before the drop may start a thread
+/// (no runtime, no reqwest client): `fork` must see a single-threaded process.
+fn main() {
     tracing_subscriber::fmt::init();
+
+    if !geteuid().is_root() {
+        fatal("tmuxwrapper must start as root (it drops privileges itself)");
+    }
 
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
+    let config = Config::load(Path::new(&config_path))
+        .unwrap_or_else(|e| fatal(&format!("failed to load config: {e}")));
+    let run_as = match ResolvedUser::by_name(&config.run_as) {
+        Ok(Some(user)) => user,
+        Ok(None) => fatal(&format!(
+            "system user '{}' not found — run deploy.sh",
+            config.run_as
+        )),
+        Err(e) => fatal(&e),
+    };
 
-    let config = Config::load(Path::new(&config_path)).expect("failed to load config");
+    let helper_socks = fork_helpers(&config);
+
+    if let Err(e) = drop_privileges(run_as.uid, run_as.gid, &[]) {
+        fatal(&format!("front: {e}"));
+    }
+    info!(user = %run_as.name, "front dropped privileges");
+
+    // The helpers' PDEATHSIG fires when the thread that forked them exits,
+    // so that must be the thread that lives as long as the process: main,
+    // which blocks here until shutdown.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| fatal(&format!("failed to build tokio runtime: {e}")));
+    rt.block_on(run_front(config, helper_socks));
+}
+
+/// Log and exit non-zero. Only for startup, before any input is handled.
+fn fatal(msg: &str) -> ! {
+    error!("{msg}");
+    std::process::exit(1)
+}
+
+/// Fork one helper per configured user and return the front's socket ends,
+/// keyed by unix user. A user who doesn't exist is logged and skipped (their
+/// requests fail closed). Runs as root, single-threaded.
+fn fork_helpers(config: &Config) -> Vec<(String, OwnedFd)> {
+    // Guard the invariant the forks rely on (see main).
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    if !status
+        .lines()
+        .any(|l| l.split_whitespace().eq(["Threads:", "1"]))
+    {
+        fatal("refusing to fork helpers: process is not single-threaded");
+    }
+    let parent = getpid();
+    let mut fronts: Vec<(String, OwnedFd)> = Vec::new();
+    for user in &config.users {
+        let resolved = match ResolvedUser::from_config(user) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                error!(error = %e, "no helper for this user");
+                continue;
+            }
+        };
+        let (front, back) = seqpacket_pair()
+            .unwrap_or_else(|e| fatal(&format!("failed to create helper socket: {e}")));
+        // SAFETY: no other thread exists yet (no runtime, no reqwest client),
+        // so the child is an ordinary single-threaded process and may run
+        // ordinary Rust after the fork — no async-signal-safety restriction.
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Keep only our own end: drop the front's end of our socket
+                // and of every earlier helper's (their helper ends were
+                // closed in the parent right after each fork).
+                drop(front);
+                fronts.clear();
+                become_helper(back, user, resolved, config, parent)
+            }
+            Ok(ForkResult::Parent { child }) => {
+                drop(back);
+                info!(unix_user = %user.unix_user, pid = %child, "forked helper");
+                fronts.push((user.unix_user.clone(), front));
+            }
+            Err(e) => fatal(&format!("fork failed: {e}")),
+        }
+    }
+    fronts
+}
+
+/// The forked child: drop to `resolved`, tie our life to the front's, set up
+/// the user's environment and run the helper. Never returns.
+fn become_helper(
+    sock: OwnedFd,
+    user: &UserConfig,
+    resolved: ResolvedUser,
+    config: &Config,
+    parent: Pid,
+) -> ! {
+    if let Err(e) = drop_privileges(resolved.uid, resolved.gid, &[resolved.gid]) {
+        fatal(&format!("helper for '{}': {e}", user.unix_user));
+    }
+    // After the drop: a credential change clears the parent-death signal.
+    if let Err(e) = prctl::set_pdeathsig(Signal::SIGTERM) {
+        fatal(&format!("helper: PR_SET_PDEATHSIG failed: {e}"));
+    }
+    if getppid() != parent {
+        // The front died before PDEATHSIG was armed.
+        warn!("helper: front already exited");
+        std::process::exit(1);
+    }
+    let uid = resolved.uid.as_raw();
+    // SAFETY: single-threaded child before any runtime.
+    unsafe {
+        std::env::set_var("HOME", &resolved.home);
+        std::env::set_var("USER", &resolved.name);
+        std::env::set_var("LOGNAME", &resolved.name);
+        std::env::set_var("SHELL", &resolved.shell);
+        std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
+        std::env::set_var(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path=/run/user/{uid}/bus"),
+        );
+        std::env::remove_var("TMUX");
+    }
+    info!(unix_user = %user.unix_user, "helper dropped privileges");
+    run_helper(
+        sock,
+        user.clone(),
+        PathBuf::from(resolved.home),
+        &config.cloudflare,
+        config.terminal.max_sessions_per_user,
+    )
+}
+
+/// The front, after the drop: JWKS, helper clients, HTTP.
+async fn run_front(config: Config, helper_socks: Vec<(String, OwnedFd)>) {
     let listen_addr = config.listen.clone();
 
     let cf = &config.cloudflare;
     let jwks = JwksCache::new(&cf.resolved_jwks_url(), &cf.resolved_issuer(), &cf.audience);
     if let Err(e) = jwks.refresh().await {
-        tracing::warn!(error = %e, "initial JWKS fetch failed (will retry in background)");
+        warn!(error = %e, "initial JWKS fetch failed (will retry in background)");
     }
     jwks.spawn_refresh_task(cf.jwks_refresh_secs);
 
-    // Interim: Task 6 forks the helper and drops privileges instead.
-    let helpers = config
-        .users
-        .iter()
-        .filter_map(|user| {
-            let client = spawn_in_process_helper(
-                user,
-                &config.cloudflare,
-                config.terminal.max_sessions_per_user,
-            )?;
-            Some((user.unix_user.clone(), client))
+    let helpers = helper_socks
+        .into_iter()
+        .map(|(unix_user, sock)| {
+            let client = HelperClient::new(sock)
+                .unwrap_or_else(|e| fatal(&format!("failed to set up helper client: {e}")));
+            (unix_user, client)
         })
         .collect();
 
@@ -111,49 +245,6 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
-}
-
-/// Interim (replaced in Task 6): run `user`'s helper on its own thread and
-/// current-thread runtime, in this process and with its privileges. `None`
-/// (logged) if the unix user doesn't exist; that user's requests then fail.
-fn spawn_in_process_helper(
-    user: &UserConfig,
-    cf: &CloudflareConfig,
-    max_sessions: usize,
-) -> Option<HelperClient> {
-    let home = match ResolvedUser::from_config(user) {
-        Ok(resolved) => resolved.home.into(),
-        Err(e) => {
-            tracing::error!(error = %e, "no helper for this user");
-            return None;
-        }
-    };
-    let (front, back) = seqpacket_pair().expect("failed to create helper socket");
-    let user = user.clone();
-    let jwks = JwksCache::new(&cf.resolved_jwks_url(), &cf.resolved_issuer(), &cf.audience);
-    let refresh_secs = cf.jwks_refresh_secs;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build helper runtime");
-        rt.block_on(async move {
-            let sock = AsyncSeqpacket::new(back).expect("bad helper socket");
-            if let Err(e) = jwks.refresh().await {
-                tracing::warn!(error = %e, "helper: initial JWKS fetch failed (will retry in background)");
-            }
-            jwks.spawn_refresh_task(refresh_secs);
-            let ctx = HelperCtx {
-                user,
-                home,
-                jwks,
-                max_sessions,
-                tmux_socket: None,
-            };
-            helper::serve(ctx, sock).await;
-        });
-    });
-    Some(HelperClient::new(front).expect("failed to set up helper client"))
 }
 
 async fn shutdown_signal() {

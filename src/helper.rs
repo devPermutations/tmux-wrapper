@@ -190,9 +190,10 @@ pub async fn serve(ctx: HelperCtx, sock: AsyncSeqpacket) {
 }
 
 /// Process entrypoint for the helper after the privilege drop. Builds its
-/// own current-thread runtime, fetches its own JWKS, serves the front over
-/// `sock`, and exits 0 when the front goes away.
-#[allow(dead_code)] // Called by main after the fork (Task 6).
+/// own current-thread runtime, serves the front over `sock` straight away,
+/// fetches its own JWKS in the background, and exits 0 when the front goes
+/// away. Until the first fetch succeeds every request is refused with
+/// "auth keys unavailable", so a hung JWKS endpoint never stalls the socket.
 pub fn run_helper(
     sock: OwnedFd,
     user: UserConfig,
@@ -224,10 +225,13 @@ pub fn run_helper(
                 std::process::exit(1);
             }
         };
-        if let Err(e) = jwks.refresh().await {
-            warn!(error = %e, "helper: initial JWKS fetch failed (will retry in background)");
-        }
-        jwks.spawn_refresh_task(refresh_secs);
+        let background = jwks.clone();
+        tokio::spawn(async move {
+            if let Err(e) = background.refresh().await {
+                warn!(error = %e, "helper: initial JWKS fetch failed (will retry in background)");
+            }
+            background.spawn_refresh_task(refresh_secs);
+        });
         let ctx = HelperCtx {
             user,
             home,

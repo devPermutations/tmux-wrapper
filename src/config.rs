@@ -173,6 +173,16 @@ impl Config {
                 ));
             }
         }
+        // Helpers are keyed by unix_user (one forked helper per user).
+        let mut seen = std::collections::HashSet::new();
+        for user in &self.users {
+            if !seen.insert(user.unix_user.as_str()) {
+                return Err(format!(
+                    "unix_user '{}' is configured more than once",
+                    user.unix_user
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -431,5 +441,16 @@ tmux_session = "main"
             let err = Config::from_toml_str(&toml).unwrap_err().to_string();
             assert!(err.contains("run_as"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn duplicate_unix_user_rejected() {
+        // Helpers are keyed by unix_user: two entries would fork two helpers
+        // and silently keep only one of them.
+        let toml = format!(
+            "{VALID}\n[[users]]\nemail = \"other@example.com\"\nunix_user = \"alice\"\ntmux_session = \"main\"\n"
+        );
+        let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert_eq!(err, "unix_user 'alice' is configured more than once");
     }
 }
