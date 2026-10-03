@@ -153,7 +153,7 @@ pub async fn kill_session(name: &str, socket: Option<&Path>) -> io::Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ScratchTmux;
+    use crate::test_support::{ScratchTmux, tmux_available};
 
     #[test]
     fn session_names_allow_alphanumeric_underscore_dash() {
@@ -260,6 +260,10 @@ mod tests {
 
     #[tokio::test]
     async fn nonexistent_socket_means_not_running() {
+        if !tmux_available() {
+            eprintln!("skipping: /usr/bin/tmux not available");
+            return;
+        }
         let sock = std::env::temp_dir().join("tmuxwrapper-test-no-such-socket");
         assert_eq!(query_server(Some(&sock)).await, TmuxServer::NotRunning);
         assert!(list_sessions(Some(&sock)).await.is_empty());

@@ -96,12 +96,17 @@ pub struct ScratchTmux {
     sock: std::path::PathBuf,
 }
 
+/// Whether tmux-dependent tests can run; they skip when it is absent.
+pub fn tmux_available() -> bool {
+    std::path::Path::new("/usr/bin/tmux").exists()
+}
+
 impl ScratchTmux {
     /// `None` when `/usr/bin/tmux` is absent or the server won't start.
     pub fn start(first_session: &str) -> Option<Self> {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
-        if !std::path::Path::new("/usr/bin/tmux").exists() {
+        if !tmux_available() {
             return None;
         }
         let dir = std::env::temp_dir().join(format!(
