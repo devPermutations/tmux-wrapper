@@ -140,10 +140,11 @@ terminals: contention is negligible). 10 s timeout per request.
 ## Rollout
 
 1. Build and test entirely on the feature branch; parallel instance only.
-2. Swap production when Virgil is reachable at a computer, or with an
-   automatic rollback (see open question).
-3. Rollback: restore `/opt/tmuxwrapper.bak-<date>` and the previous unit,
-   `daemon-reload`, restart.
+2. Swap production with Virgil at a computer (decided; no automatic
+   rollback). `deploy.sh` backs up the installed binary, static files and
+   unit to `/opt/tmuxwrapper.bak-<YYYYmmdd-HHMMSS>/` first.
+3. Rollback: `./rollback.sh [backup dir]` restores the binary, static files
+   and previous unit together, `daemon-reload`s and restarts.
 
 ## Out of scope
 

@@ -48,6 +48,15 @@ cargo build --release
 
 That installs the binary to `/opt/tmuxwrapper/`, copies static assets, and registers the systemd unit. Re-running it upgrades in place: an existing `/opt/tmuxwrapper/config.toml` is kept and a running service is restarted.
 
+Before installing anything, `deploy.sh` copies the currently installed binary, static files and systemd unit (whichever exist) to `/opt/tmuxwrapper.bak-<YYYYmmdd-HHMMSS>/` and prints that path. To undo an upgrade:
+
+```bash
+./rollback.sh                                     # newest /opt/tmuxwrapper.bak-*
+./rollback.sh /opt/tmuxwrapper.bak-20261003-201500  # or a specific backup
+```
+
+`rollback.sh` restores the binary, static files and unit together (an older binary may not run under a newer unit), runs `systemctl daemon-reload`, and restarts the service if it was running. It never touches `config.toml`.
+
 Each unix user in the config needs a tmux server running from a user unit:
 
 ```bash
@@ -116,7 +125,7 @@ Tunnel the application hostname (`term.example.com`) to `http://127.0.0.1:7681` 
 
 The service starts as root, but the process that faces the network does not stay root:
 
-- **Front** — HTTP/WebSocket handling and the first JWT check run as `run_as` (default `tmuxwrapper`), a no-login system user with no home and no group memberships that matter.
+- **Front** — HTTP/WebSocket handling and the first JWT check run as `run_as` (default `tmuxwrapper`), a no-login system user with no home and no supplementary groups.
 - **Helper** — one per target unix user, forked while still root. It drops to that user (uid and primary gid only, no supplementary groups) and spawns the PTY. It re-verifies every Access JWT itself, so a compromised front can't ask for a terminal as someone it holds no valid token for.
 - **No sudo** — nothing escalates after the drop.
 
