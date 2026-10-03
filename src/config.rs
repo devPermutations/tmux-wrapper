@@ -183,6 +183,13 @@ impl Config {
                 ));
             }
         }
+        // The front must not be the account it is isolated from.
+        if seen.contains(self.run_as.as_str()) {
+            return Err(format!(
+                "run_as '{}' is also a configured unix_user — use a dedicated system user",
+                self.run_as
+            ));
+        }
         Ok(())
     }
 
@@ -452,5 +459,15 @@ tmux_session = "main"
         );
         let err = Config::from_toml_str(&toml).unwrap_err().to_string();
         assert_eq!(err, "unix_user 'alice' is configured more than once");
+    }
+
+    #[test]
+    fn run_as_equal_to_a_unix_user_rejected() {
+        let toml = format!("run_as = \"alice\"\n{VALID}");
+        let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "run_as 'alice' is also a configured unix_user — use a dedicated system user"
+        );
     }
 }

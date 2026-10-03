@@ -267,7 +267,9 @@ mod tests {
     }
 
     fn pipe() -> (std::fs::File, std::fs::File) {
-        let (r, w) = nix::unistd::pipe().unwrap();
+        // Close-on-exec: a tmux process spawned by a concurrent test must
+        // not inherit the write end (it would look like a leak here).
+        let (r, w) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
         (r.into(), w.into())
     }
 

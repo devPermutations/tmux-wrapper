@@ -17,7 +17,7 @@ use crate::helper::run_helper;
 use crate::helper_client::HelperClient;
 use crate::privdrop::drop_privileges;
 use crate::proto::seqpacket_pair;
-use crate::user::ResolvedUser;
+use crate::user::{ResolvedUser, shares_identity};
 use crate::ws::{AppState, kill_session_handler, sessions_handler, ws_handler};
 use axum::Router;
 use axum::routing::{delete, get};
@@ -58,7 +58,26 @@ fn main() {
         Err(e) => fatal(&e),
     };
 
-    let helper_socks = fork_helpers(&config);
+    // Unknown users are logged and skipped: their requests fail closed.
+    let users: Vec<(&UserConfig, ResolvedUser)> = config
+        .users
+        .iter()
+        .filter_map(|user| match ResolvedUser::from_config(user) {
+            Ok(resolved) => Some((user, resolved)),
+            Err(e) => {
+                error!(error = %e, "no helper for this user");
+                None
+            }
+        })
+        .collect();
+    if let Some(clash) = shares_identity(&run_as, users.iter().map(|(_, r)| r)) {
+        fatal(&format!(
+            "run_as '{}' shares uid/gid with unix_user '{}' — use a dedicated system user",
+            run_as.name, clash.name
+        ));
+    }
+
+    let helper_socks = fork_helpers(users, &config);
 
     if let Err(e) = drop_privileges(run_as.uid, run_as.gid, &[]) {
         fatal(&format!("front: {e}"));
@@ -81,10 +100,12 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-/// Fork one helper per configured user and return the front's socket ends,
-/// keyed by unix user. A user who doesn't exist is logged and skipped (their
-/// requests fail closed). Runs as root, single-threaded.
-fn fork_helpers(config: &Config) -> Vec<(String, OwnedFd)> {
+/// Fork one helper per resolved user and return the front's socket ends,
+/// keyed by unix user. Runs as root, single-threaded.
+fn fork_helpers(
+    users: Vec<(&UserConfig, ResolvedUser)>,
+    config: &Config,
+) -> Vec<(String, OwnedFd)> {
     // Guard the invariant the forks rely on (see main).
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     if !status
@@ -95,14 +116,7 @@ fn fork_helpers(config: &Config) -> Vec<(String, OwnedFd)> {
     }
     let parent = getpid();
     let mut fronts: Vec<(String, OwnedFd)> = Vec::new();
-    for user in &config.users {
-        let resolved = match ResolvedUser::from_config(user) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                error!(error = %e, "no helper for this user");
-                continue;
-            }
-        };
+    for (user, resolved) in users {
         let (front, back) = seqpacket_pair()
             .unwrap_or_else(|e| fatal(&format!("failed to create helper socket: {e}")));
         // SAFETY: no other thread exists yet (no runtime, no reqwest client),
