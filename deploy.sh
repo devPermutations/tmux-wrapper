@@ -6,6 +6,9 @@ set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="/opt/tmuxwrapper"
 
+echo "==> Ensuring system user tmuxwrapper"
+id tmuxwrapper >/dev/null 2>&1 || sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tmuxwrapper
+
 echo "==> Installing binary"
 sudo install -D -m 0755 "$SRC/target/release/tmuxwrapper" "$DEST/tmuxwrapper"
 

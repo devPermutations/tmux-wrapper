@@ -17,20 +17,26 @@ KillMode=process
 # sequenced before kill-server; see contrib/). A save here raced that kill
 # at reboot and clobbered `last` with a 0-byte file.
 
-# Needs root to setuid/setgid into target users
+# Starts as root, then drops privileges itself: a per-user helper setuids to
+# the target user, the front drops to run_as (default: tmuxwrapper).
 User=root
 Group=root
 
 # Hardening
-NoNewPrivileges=no
+NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/tmp /home
+ProtectHome=read-only
+ReadWritePaths=/tmp
 PrivateTmp=false
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_FOWNER
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=multi-user.target
