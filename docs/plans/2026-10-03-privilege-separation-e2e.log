@@ -1,0 +1,33 @@
+--- build (release)
+   Compiling tmuxwrapper v0.1.0 (/home/ktulu/projects/tmuxwrapper-privsep)
+    Finished `release` profile [optimized] target(s) in 47.17s
+--- throwaway RSA key + JWKS
+--- unit properties: --property=KillMode=process --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=read-only --property=ReadWritePaths=/tmp --property=PrivateTmp=false --property=CapabilityBoundingSet=CAP_SETUID CAP_SETGID --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes --property=ProtectControlGroups=yes --property=RestrictNamespaces=yes --property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 --property=SystemCallFilter=@system-service --property=LockPersonality=yes --property=RestrictRealtime=yes
+--- start unit
+Running as unit: tmuxwrapper-e2e.service; invocation ID: b2a32bfb2aec4aae83c517b869e71cf0
+PASS: unit started and listening on 127.0.0.1:7682
+--- cargo e2e tests
+   Compiling tmuxwrapper v0.1.0 (/home/ktulu/projects/tmuxwrapper-privsep)
+    Finished `release` profile [optimized] target(s) in 46.86s
+     Running tests/e2e_privsep.rs (target/release/deps/e2e_privsep-7098a790e71662fd)
+
+running 6 tests
+test bad_tokens_rejected_at_front ... ok
+test no_zombies_after_sockets_close ... ok
+test process_model ... ok
+test sessions_list_and_delete ... ok
+test socket_closes_4001_when_token_expires ... ok
+test terminal_echo ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.97s
+
+PASS: cargo e2e tests
+--- helper death: kill -9 helper => main exits within 15 s
+Running as unit: tmuxwrapper-e2e.service; invocation ID: 9689bc8dcb0d47acb3600830f6b6fe91
+PASS: helper death: main exited
+--- front death: kill -9 front => helper gone within 5 s
+Running as unit: tmuxwrapper-e2e.service; invocation ID: 60720a72707049019d03bb1db910c7c7
+PASS: front death: helper exited
+---
+RESULT: ALL CHECKS PASSED
+--- cleanup
