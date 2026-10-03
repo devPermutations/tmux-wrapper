@@ -22,9 +22,10 @@ use tracing::{error, info, warn};
 /// `[terminal] max_sessions_per_user`.
 const MAX_CONCURRENT_CONNECTIONS_PER_USER: usize = 5;
 
-/// Close code used when a connection or session limit refuses the socket.
-/// The reason text is surfaced verbatim by the frontend.
-const CLOSE_CODE_LIMIT: u16 = 4004;
+/// Close code used when the server refuses the socket (a connection or
+/// session limit, or no tmux server to attach to). The reason text is
+/// surfaced verbatim by the frontend.
+const CLOSE_CODE_REFUSED: u16 = 4004;
 
 /// Session names may only contain [a-zA-Z0-9_-].
 fn is_valid_session_name(name: &str) -> bool {
@@ -37,6 +38,30 @@ fn is_valid_session_name(name: &str) -> bool {
 /// allowed regardless of the cap.
 fn refuses_new_session(existing: &[String], requested: &str, cap: usize) -> bool {
     !existing.iter().any(|s| s == requested) && existing.len() >= cap
+}
+
+/// What `tmux list-sessions` (run as the user) says about their tmux server.
+#[derive(Debug, PartialEq)]
+enum TmuxServer {
+    Running(Vec<String>),
+    NotRunning,
+    /// The listing failed for some other reason (e.g. sudo misconfigured).
+    Unknown,
+}
+
+fn classify_list_sessions(success: bool, stdout: &str, stderr: &str) -> TmuxServer {
+    if success {
+        return TmuxServer::Running(stdout.lines().map(str::to_string).collect());
+    }
+    // tmux 3.4: a stale socket says "no server running on <path>"; a missing
+    // one says "error connecting to <path> (No such file or directory)".
+    let no_socket = stderr.contains("error connecting")
+        && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"));
+    if stderr.contains("no server running") || no_socket {
+        TmuxServer::NotRunning
+    } else {
+        TmuxServer::Unknown
+    }
 }
 
 /// Mask email for logging: "user@example.com" → "us***@example.com"
@@ -273,20 +298,18 @@ pub async fn ws_handler(
 async fn refuse_socket(mut socket: WebSocket, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
-            code: CLOSE_CODE_LIMIT,
+            code: CLOSE_CODE_REFUSED,
             reason: reason.into(),
         })))
         .await;
 }
 
-/// Names of the user's existing tmux sessions.
-/// Empty when the user's tmux server isn't running.
+/// Ask the user's tmux server for its sessions.
 ///
-/// Fails open (returns empty) on any error so a broken listing can't lock
-/// users out, but warns unless the failure is the legitimate "no sessions"
-/// case — otherwise e.g. a sudo misconfiguration would silently disable the
-/// session cap (PTY spawn doesn't go through sudo, so sessions still spawn).
-async fn list_session_names(unix_user: &str) -> Vec<String> {
+/// `Unknown` fails open for the session cap so a broken listing can't lock
+/// users out, but warns — otherwise e.g. a sudo misconfiguration would
+/// silently disable the cap (PTY spawn doesn't go through sudo).
+async fn query_tmux_server(unix_user: &str) -> TmuxServer {
     let output = tokio::process::Command::new("/usr/bin/sudo")
         .args([
             "-u",
@@ -299,15 +322,14 @@ async fn list_session_names(unix_user: &str) -> Vec<String> {
         .output()
         .await;
     match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            // tmux exits non-zero with these when the user simply has no
-            // running server — not worth a warning.
-            if !stderr.contains("no server running") && !stderr.contains("error connecting") {
+            let server = classify_list_sessions(
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                &stderr,
+            );
+            if server == TmuxServer::Unknown {
                 warn!(
                     unix_user = %unix_user,
                     status = %out.status,
@@ -315,7 +337,7 @@ async fn list_session_names(unix_user: &str) -> Vec<String> {
                     "tmux list-sessions failed — session cap not enforced for this connection"
                 );
             }
-            Vec::new()
+            server
         }
         Err(e) => {
             warn!(
@@ -323,8 +345,30 @@ async fn list_session_names(unix_user: &str) -> Vec<String> {
                 error = %e,
                 "failed to run tmux list-sessions — session cap not enforced for this connection"
             );
-            Vec::new()
+            TmuxServer::Unknown
         }
+    }
+}
+
+/// Start the user's `tmux-server.service` (D-012), so a server that exited —
+/// e.g. after the last session was killed from the picker — comes back in
+/// its clean systemd context rather than inside this sandboxed service.
+async fn start_tmux_server_unit(unix_user: &str) {
+    let machine = format!("{unix_user}@");
+    let output = tokio::process::Command::new("/usr/bin/systemctl")
+        .args(["--user", "-M", &machine, "start", "tmux-server.service"])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            info!(unix_user = %unix_user, "started tmux-server.service");
+        }
+        Ok(out) => warn!(
+            unix_user = %unix_user,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "could not start tmux-server.service"
+        ),
+        Err(e) => warn!(unix_user = %unix_user, error = %e, "failed to run systemctl"),
     }
 }
 
@@ -367,9 +411,30 @@ async fn handle_socket(
         resolved.tmux_session = name;
     }
 
+    // Never let `tmux new-session` start a server here: it would inherit this
+    // service's sandbox (read-only /, root's cgroup) — the D-012 failure.
+    let mut server = query_tmux_server(&user_config.unix_user).await;
+    if server == TmuxServer::NotRunning {
+        start_tmux_server_unit(&user_config.unix_user).await;
+        server = query_tmux_server(&user_config.unix_user).await;
+    }
+    let existing = match server {
+        TmuxServer::Running(names) => names,
+        TmuxServer::Unknown => Vec::new(),
+        TmuxServer::NotRunning => {
+            warn!(user = %display_name, "no tmux server and tmux-server.service didn't start one");
+            refuse_socket(
+                socket,
+                "tmux server isn't running — start tmux-server.service",
+            )
+            .await;
+            decrement_session(&state, &session_key).await;
+            return;
+        }
+    };
+
     // Real tmux-session cap: spawning a NEW session name is refused past the
     // limit; attaching to an existing session is always allowed.
-    let existing = list_session_names(&user_config.unix_user).await;
     if refuses_new_session(
         &existing,
         &resolved.tmux_session,
@@ -586,7 +651,9 @@ async fn run_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_session_name, mask_email, refuses_new_session};
+    use super::{
+        TmuxServer, classify_list_sessions, is_valid_session_name, mask_email, refuses_new_session,
+    };
 
     #[test]
     fn session_names_allow_alphanumeric_underscore_dash() {
@@ -635,5 +702,42 @@ mod tests {
         assert_eq!(mask_email("user@example.com"), "us***@example.com");
         assert_eq!(mask_email("ab@example.com"), "ab***@example.com");
         assert_eq!(mask_email("not-an-email"), "***");
+    }
+
+    #[test]
+    fn listing_with_sessions_means_running() {
+        assert_eq!(
+            classify_list_sessions(true, "main\nwork\n", ""),
+            TmuxServer::Running(vec!["main".into(), "work".into()])
+        );
+    }
+
+    #[test]
+    fn missing_socket_means_not_running() {
+        let stderr = "error connecting to /tmp/tmux-1000/default (No such file or directory)\n";
+        assert_eq!(
+            classify_list_sessions(false, "", stderr),
+            TmuxServer::NotRunning
+        );
+    }
+
+    #[test]
+    fn stale_socket_means_not_running() {
+        let stderr = "no server running on /tmp/tmux-1000/default\n";
+        assert_eq!(
+            classify_list_sessions(false, "", stderr),
+            TmuxServer::NotRunning
+        );
+    }
+
+    #[test]
+    fn other_failures_are_unknown() {
+        let denied = "error connecting to /tmp/tmux-1000/default (Permission denied)\n";
+        assert_eq!(
+            classify_list_sessions(false, "", denied),
+            TmuxServer::Unknown
+        );
+        let sudo = "sudo: unknown user ghost\n";
+        assert_eq!(classify_list_sessions(false, "", sudo), TmuxServer::Unknown);
     }
 }
