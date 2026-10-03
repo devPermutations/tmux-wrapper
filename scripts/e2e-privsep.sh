@@ -96,6 +96,12 @@ jwks_url = "http://127.0.0.1:$JWKS_PORT/certs.json"
 issuer = "https://e2e.cloudflareaccess.com"
 jwks_refresh_secs = 3600
 
+[terminal]
+ping_interval_secs = 30
+# The cap counts ALL of ktulu's tmux sessions on the real server (many already
+# exist), so the default of 5 would refuse new e2e sessions.
+max_sessions_per_user = 100
+
 [[users]]
 email = "e2e@example.com"
 unix_user = "ktulu"
@@ -148,7 +154,11 @@ wait_gone() { # pid seconds
 }
 
 echo "--- start unit"
-start_unit || die "unit did not come up on $ADDR (see: journalctl -u $UNIT)"
+if ! start_unit; then
+  echo "--- unit failed to come up; last journal lines:"
+  sudo -n journalctl -u "$UNIT" -n 20 --no-pager
+  die "unit did not come up on $ADDR"
+fi
 pass "unit started and listening on $ADDR"
 
 echo "--- cargo e2e tests"
