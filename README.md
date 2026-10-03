@@ -29,7 +29,7 @@ If you need local password auth or self-hosted TLS, this isn't the project for y
 
 ## Features
 
-- **Cloudflare Access auth** — JWT verified against your team's JWKS (cached, periodic refresh; failed fetches retry with backoff so a blip at boot doesn't lock everyone out)
+- **Cloudflare Access auth** — JWT verified against your team's JWKS (cached, periodic refresh; failed fetches retry with backoff so a blip at boot doesn't lock everyone out). Open terminals close when the Access session behind them expires, and the client reloads through the Access login instead of looping on reconnect
 - **Email → unix user** — the email in the access JWT maps to a real account on the box, isolated per user via setuid
 - **Tmux per user** — every session attaches to a named tmux session as the target unix user
 - **Session caps** — at most 5 WebSocket connections per user, and a configurable cap on distinct tmux sessions (`max_sessions_per_user`, default 5). Creating a session past the cap is refused with a visible message; attaching to an existing one always works
