@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod helper;
 mod proto;
 mod pty;
 #[cfg(test)]
