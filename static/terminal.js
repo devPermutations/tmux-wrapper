@@ -32,6 +32,20 @@
     const container = document.getElementById('terminal');
     term.open(container);
 
+    // WebGL renderer: much cheaper full-pane redraws than the default DOM
+    // renderer, and every scroll step repaints the pane. Falls back to the
+    // DOM renderer if WebGL is unavailable or its context is lost (iOS can
+    // drop it while the app is backgrounded).
+    if (window.WebglAddon) {
+        try {
+            const webgl = new WebglAddon.WebglAddon();
+            webgl.onContextLoss(function () { webgl.dispose(); });
+            term.loadAddon(webgl);
+        } catch (e) {
+            // keep the DOM renderer
+        }
+    }
+
     // Disable autocorrect/autocapitalize on xterm's hidden textarea
     const textarea = container.querySelector('.xterm-helper-textarea');
     if (textarea) {
@@ -426,6 +440,13 @@
             'ArrowDown': ctrl ? '\x1b[1;5B' : '\x1b[B',
             'ArrowRight': ctrl ? '\x1b[1;5C' : '\x1b[C',
             'ArrowLeft': ctrl ? '\x1b[1;5D' : '\x1b[D',
+            // Scroll keys — Claude Code (fullscreen) scrolls half a screen on
+            // PgUp/PgDn, jumps to the start on Ctrl+Home and back to the
+            // latest message on Ctrl+End. tmux passes all four through.
+            'PageUp': '\x1b[5~',
+            'PageDown': '\x1b[6~',
+            'ScrollTop': '\x1b[1;5H',
+            'ScrollBottom': '\x1b[1;5F',
         };
         var seq = sequences[key];
         if (seq) {
@@ -434,55 +455,70 @@
     }
 
     // --- Mobile touch scrolling ---
-    // xterm.js renders a canvas (.xterm-screen) on top of the scrollable
-    // .xterm-viewport div. Touch events hit the canvas and never reach the
-    // scroll container. We dispatch synthetic wheel events so xterm.js handles
-    // both normal scrollback AND alternate-screen apps (vim, claude, less, etc.)
+    // Touches land on xterm's render surface, not a native scroller, so we
+    // scroll by sending wheel ticks: tmux scrolls copy-mode on them, and
+    // mouse-aware apps (Claude Code fullscreen, vim, less) get them as mouse
+    // wheel reports. ScrollEngine turns finger travel into a paced number of
+    // ticks, with momentum after a flick. Each tick is a one-line wheel
+    // event, which xterm.js turns into exactly one wheel report.
     (function () {
         var screen = container.querySelector('.xterm-screen');
-        if (!screen) return;
+        if (!screen || !window.ScrollEngine) return;
 
-        var touchStartY = 0;
-        var touchStartX = 0;
-        var scrolling = false;
-        var SCROLL_THRESHOLD = 10;
-        var LINE_HEIGHT = 20; // approx pixels per scroll line
+        // ~2 rows of 14px text per tick: keeps slow drags at about the tick
+        // rate the old per-touchmove wheel handler produced, while flicks now
+        // coast. Claude Code's lines-per-tick is undocumented; tune by feel.
+        var engine = ScrollEngine.create({ pxPerStep: 35, maxStepsPerFrame: 4 });
+        var animating = false;
+
+        function sendWheelTick(direction) {
+            screen.dispatchEvent(new WheelEvent('wheel', {
+                deltaY: direction,
+                deltaMode: WheelEvent.DOM_DELTA_LINE,
+                bubbles: true,
+                cancelable: true,
+            }));
+        }
+
+        function tick() {
+            var steps = engine.frame(performance.now());
+            var direction = steps > 0 ? 1 : -1;
+            for (var i = 0; i < Math.abs(steps); i++) {
+                sendWheelTick(direction);
+            }
+            if (engine.isActive()) {
+                requestAnimationFrame(tick);
+            } else {
+                animating = false;
+            }
+        }
+
+        function animate() {
+            if (!animating && engine.isActive()) {
+                animating = true;
+                requestAnimationFrame(tick);
+            }
+        }
 
         container.addEventListener('touchstart', function (e) {
             if (e.touches.length !== 1) return;
-            touchStartY = e.touches[0].clientY;
-            touchStartX = e.touches[0].clientX;
-            scrolling = false;
+            engine.touchStart(e.touches[0].clientX, e.touches[0].clientY, performance.now());
         }, { passive: true });
 
         container.addEventListener('touchmove', function (e) {
             if (e.touches.length !== 1) return;
-            var dy = touchStartY - e.touches[0].clientY;
-            var dx = touchStartX - e.touches[0].clientX;
-
-            if (!scrolling) {
-                if (Math.abs(dy) > SCROLL_THRESHOLD && Math.abs(dy) > Math.abs(dx)) {
-                    scrolling = true;
-                } else {
-                    return;
-                }
+            if (engine.touchMove(e.touches[0].clientX, e.touches[0].clientY, performance.now())) {
+                e.preventDefault();
+                animate();
             }
-
-            // Dispatch a synthetic wheel event on the xterm screen element.
-            // xterm.js listens for wheel events and handles scrolling for both
-            // the normal buffer (scrollback) and alternate buffer (mouse apps).
-            screen.dispatchEvent(new WheelEvent('wheel', {
-                deltaY: dy,
-                deltaX: 0,
-                deltaMode: 0, // DOM_DELTA_PIXEL
-                bubbles: true,
-                cancelable: true,
-            }));
-
-            touchStartY = e.touches[0].clientY;
-            touchStartX = e.touches[0].clientX;
-            e.preventDefault();
         }, { passive: false });
+
+        function onTouchEnd() {
+            engine.touchEnd(performance.now());
+            animate();
+        }
+        container.addEventListener('touchend', onTouchEnd, { passive: true });
+        container.addEventListener('touchcancel', onTouchEnd, { passive: true });
     })();
 
     // Keep terminal focused

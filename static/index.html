@@ -17,6 +17,10 @@
     <div id="terminal"></div>
     <div id="key-bar">
         <button data-key="sessions" id="btn-sessions">&#9776;</button>
+        <button data-key="PageUp" class="scroll-key" aria-label="Page up" title="Page up">&#8670;</button>
+        <button data-key="PageDown" class="scroll-key" aria-label="Page down" title="Page down">&#8671;</button>
+        <button data-key="ScrollTop" class="scroll-key" aria-label="Scroll to top" title="Scroll to top">&#10514;</button>
+        <button data-key="ScrollBottom" class="scroll-key" aria-label="Scroll to latest" title="Scroll to latest">&#10515;</button>
         <button data-key="Escape">Esc</button>
         <button data-key="ctrl" id="btn-ctrl">Ctrl</button>
         <button data-key="Tab">Tab</button>
@@ -53,6 +57,8 @@
     <script src="/vendor/xterm.js"></script>
     <script src="/vendor/addon-fit.js"></script>
     <script src="/vendor/addon-web-links.js"></script>
+    <script src="/vendor/addon-webgl.js"></script>
+    <script src="/scroll-engine.js"></script>
     <script src="/terminal.js?v=14"></script>
 </body>
 </html>
