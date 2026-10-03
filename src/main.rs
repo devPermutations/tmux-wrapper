@@ -1,6 +1,8 @@
 mod auth;
 mod config;
 mod pty;
+#[cfg(test)]
+mod test_support;
 mod user;
 mod ws;
 
@@ -29,7 +31,7 @@ async fn main() {
     let listen_addr = config.listen.clone();
 
     let cf = &config.cloudflare;
-    let jwks = JwksCache::new(&cf.team_domain, &cf.audience);
+    let jwks = JwksCache::new(&cf.resolved_jwks_url(), &cf.resolved_issuer(), &cf.audience);
     if let Err(e) = jwks.refresh().await {
         tracing::warn!(error = %e, "initial JWKS fetch failed (will retry in background)");
     }
