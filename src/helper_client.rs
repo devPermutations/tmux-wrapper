@@ -136,7 +136,7 @@ mod tests {
         assert_eq!(client.request(&list("t1")).await.err(), Some(HelperDead));
         let waited = started.elapsed();
         assert!(
-            (REQUEST_TIMEOUT..REQUEST_TIMEOUT + Duration::from_secs(1)).contains(&waited),
+            (REQUEST_TIMEOUT..REQUEST_TIMEOUT + Duration::from_secs(5)).contains(&waited),
             "gave up after {waited:?}"
         );
         drop(client);

@@ -154,13 +154,13 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
 }
 
 /// Blocking send of one message, optionally with one fd.
-#[allow(dead_code)] // Blocking variant: only tests use it so far.
+#[cfg(test)]
 pub fn send<T: Serialize>(sock: BorrowedFd, msg: &T, fd: Option<BorrowedFd>) -> io::Result<()> {
     send_bytes(sock, &encode(msg)?, fd)
 }
 
 /// Blocking receive of one message and its optional fd.
-#[allow(dead_code)] // Blocking variant: only tests use it so far.
+#[cfg(test)]
 pub fn recv<T: DeserializeOwned>(sock: BorrowedFd) -> io::Result<(T, Option<OwnedFd>)> {
     let (bytes, fd) = recv_bytes(sock)?;
     Ok((decode(&bytes)?, fd))

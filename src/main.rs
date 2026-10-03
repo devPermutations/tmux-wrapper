@@ -84,6 +84,12 @@ fn main() {
         fatal(&format!("front: {e}"));
     }
     info!(user = %run_as.name, "front dropped privileges");
+    if !static_dir_readable(Path::new(&config.static_dir)) {
+        fatal(&format!(
+            "static_dir '{}' is not readable by run_as '{}'",
+            config.static_dir, run_as.name
+        ));
+    }
 
     // The helpers' PDEATHSIG fires when the thread that forked them exits,
     // so that must be the thread that lives as long as the process: main,
@@ -93,6 +99,12 @@ fn main() {
         .build()
         .unwrap_or_else(|e| fatal(&format!("failed to build tokio runtime: {e}")));
     rt.block_on(run_front(config, helpers));
+}
+
+/// Whether this process can read `<static_dir>/index.html`. Checked after the
+/// front's drop: config validation ran as root, which reads anything.
+fn static_dir_readable(static_dir: &Path) -> bool {
+    std::fs::File::open(static_dir.join("index.html")).is_ok()
 }
 
 /// Log and exit non-zero. Only for startup, before any input is handled.
@@ -297,4 +309,26 @@ async fn shutdown_signal() {
         info!("graceful shutdown timeout, forcing exit");
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn static_dir_readability() {
+        let dir = std::env::temp_dir().join(format!("tmuxwrapper-test-static-{}", getpid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!static_dir_readable(&dir), "no index.html");
+        let index = dir.join("index.html");
+        std::fs::write(&index, "<html></html>").unwrap();
+        assert!(static_dir_readable(&dir));
+        if !geteuid().is_root() {
+            std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(!static_dir_readable(&dir), "unreadable index.html");
+        }
+        assert!(!static_dir_readable(&dir.join("missing")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
