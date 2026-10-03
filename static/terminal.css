@@ -70,6 +70,11 @@ html, body {
     padding: 10px 10px;
 }
 
+#key-bar button.scroll-key {
+    background: #1e2a22;
+    border-color: #3a5a44;
+}
+
 #key-bar button.active {
     background: #0066cc;
     color: #fff;
