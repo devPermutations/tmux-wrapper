@@ -9,8 +9,7 @@
 use nix::cmsg_space;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
-    sendmsg, socketpair,
+    AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, recvmsg, sendmsg, socketpair,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -95,7 +94,7 @@ fn send_bytes(sock: BorrowedFd, bytes: &[u8], fd: Option<BorrowedFd>) -> io::Res
 fn recv_bytes(sock: BorrowedFd) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
     let mut buf = vec![0u8; MAX_MESSAGE];
     let mut cmsg_buf = cmsg_space!([RawFd; MAX_FDS]);
-    let (n, flags, fds) = loop {
+    let (n, flags) = loop {
         let mut iov = [IoSliceMut::new(&mut buf)];
         match recvmsg::<()>(
             sock.as_raw_fd(),
@@ -103,22 +102,14 @@ fn recv_bytes(sock: BorrowedFd) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
             Some(&mut cmsg_buf),
             MsgFlags::MSG_CMSG_CLOEXEC,
         ) {
-            Ok(msg) => {
-                let mut fds = Vec::new();
-                if let Ok(cmsgs) = msg.cmsgs() {
-                    for c in cmsgs {
-                        if let ControlMessageOwned::ScmRights(raw) = c {
-                            // SAFETY: the kernel just installed these fds for us.
-                            fds.extend(raw.into_iter().map(|r| unsafe { OwnedFd::from_raw_fd(r) }));
-                        }
-                    }
-                }
-                break (msg.bytes, msg.flags, fds);
-            }
+            Ok(msg) => break (msg.bytes, msg.flags),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),
         }
     };
+    // Parse the fds ourselves: nix's `cmsgs()` refuses to iterate after
+    // MSG_CTRUNC, which would leak the fds the kernel did install.
+    let fds = take_scm_rights(&cmsg_buf);
     // Dropping `fds` on any early return below closes everything received.
     if flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
         return Err(invalid("truncated message"));
@@ -129,6 +120,36 @@ fn recv_bytes(sock: BorrowedFd) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
     buf.truncate(n);
     // First fd is kept; any extras are dropped (closed).
     Ok((buf, fds.into_iter().next()))
+}
+
+/// Extract every `SCM_RIGHTS` fd from a recvmsg control buffer, taking
+/// ownership of each. The buffer was zero-initialised, so a zero `cmsg_len`
+/// ends the walk.
+fn take_scm_rights(buf: &[u8]) -> Vec<OwnedFd> {
+    use nix::libc::{SCM_RIGHTS, SOL_SOCKET, c_int, cmsghdr};
+    const ALIGN: usize = std::mem::size_of::<usize>();
+    let hdr = std::mem::size_of::<cmsghdr>();
+    let hdr_data = hdr.div_ceil(ALIGN) * ALIGN;
+    let mut fds = Vec::new();
+    let mut off = 0;
+    while off + hdr <= buf.len() {
+        // SAFETY: bounds checked above; read_unaligned tolerates alignment.
+        let h: cmsghdr = unsafe { std::ptr::read_unaligned(buf[off..].as_ptr().cast()) };
+        let len = h.cmsg_len;
+        if len < hdr || off + len > buf.len() {
+            break;
+        }
+        if h.cmsg_level == SOL_SOCKET && h.cmsg_type == SCM_RIGHTS {
+            let data = &buf[(off + hdr_data).min(off + len)..off + len];
+            for c in data.chunks_exact(std::mem::size_of::<c_int>()) {
+                let raw = c_int::from_ne_bytes(c.try_into().unwrap());
+                // SAFETY: the kernel installed this fd in our table for us.
+                fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+            }
+        }
+        off += len.div_ceil(ALIGN) * ALIGN;
+    }
+    fds
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
@@ -324,31 +345,75 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
     }
 
-    #[test]
-    fn extra_fds_are_closed() {
-        let (a, b) = seqpacket_pair().unwrap();
-        let (mut r, w1) = pipe();
-        let (_r2, w2) = pipe();
-        let bytes = encode(&Response::Killed).unwrap();
-        let iov = [IoSlice::new(&bytes)];
-        let raw = [w1.as_raw_fd(), w2.as_raw_fd()];
+    /// Send raw bytes with any number of fds, bypassing `send`'s limits.
+    fn send_raw_fds(sock: &OwnedFd, bytes: &[u8], fds: &[RawFd]) {
+        let iov = [IoSlice::new(bytes)];
         sendmsg::<()>(
-            a.as_raw_fd(),
+            sock.as_raw_fd(),
             &iov,
-            &[ControlMessage::ScmRights(&raw)],
+            &[ControlMessage::ScmRights(fds)],
             MsgFlags::empty(),
             None,
         )
         .unwrap();
+    }
+
+    /// Assert every write end of this pipe is closed: a non-blocking read
+    /// must see EOF (0 bytes), not WouldBlock (a leaked write end).
+    fn assert_eof(reader: &std::fs::File, what: &str) {
+        let fd = reader.as_fd();
+        let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap());
+        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+        let mut buf = [0u8; 1];
+        match (&*reader).read(&mut buf) {
+            Ok(0) => {}
+            other => panic!("{what}: write end leaked, read gave {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_fds_are_closed() {
+        let (a, b) = seqpacket_pair().unwrap();
+        let (r1, w1) = pipe();
+        let (r2, w2) = pipe();
+        send_raw_fds(
+            &a,
+            &encode(&Response::Killed).unwrap(),
+            &[w1.as_raw_fd(), w2.as_raw_fd()],
+        );
         drop(w1);
         drop(w2);
         let (_, fd): (Response, _) = recv(b.as_fd()).unwrap();
-        // Only the first is returned; once it is dropped the pipe write end
-        // is gone (the extra was closed on receipt), so the reader sees EOF.
+        // The first fd is returned and still open; the extra must be closed.
+        assert!(fd.is_some());
+        assert_eof(&r2, "extra fd");
         drop(fd);
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).unwrap();
-        assert!(buf.is_empty());
+        assert_eof(&r1, "returned fd after drop");
+    }
+
+    #[test]
+    fn fd_closed_on_decode_failure() {
+        let (a, b) = seqpacket_pair().unwrap();
+        let (r, w) = pipe();
+        send_raw_fds(&a, b"not json", &[w.as_raw_fd()]);
+        drop(w);
+        let e = recv::<Request>(b.as_fd()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eof(&r, "fd received with bad JSON");
+    }
+
+    #[test]
+    fn fds_closed_on_ctrunc() {
+        let (a, b) = seqpacket_pair().unwrap();
+        let pipes: Vec<_> = (0..MAX_FDS + 1).map(|_| pipe()).collect();
+        let raw: Vec<RawFd> = pipes.iter().map(|(_, w)| w.as_raw_fd()).collect();
+        send_raw_fds(&a, &encode(&Response::Killed).unwrap(), &raw);
+        let readers: Vec<_> = pipes.into_iter().map(|(r, _w)| r).collect();
+        let e = recv::<Response>(b.as_fd()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        for (i, r) in readers.iter().enumerate() {
+            assert_eof(r, &format!("fd {i} after MSG_CTRUNC"));
+        }
     }
 
     #[tokio::test]
