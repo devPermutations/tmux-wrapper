@@ -1,13 +1,15 @@
 use crate::user::ResolvedUser;
 use nix::libc;
 use nix::pty::openpty;
-use nix::sys::signal;
+use nix::sys::signal::{self, Signal, kill};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, Uid, fork, setsid};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -152,9 +154,35 @@ impl PtyMaster {
 
 impl Drop for PtyMaster {
     fn drop(&mut self) {
-        let _ = nix::sys::signal::kill(self.child_pid, nix::sys::signal::Signal::SIGHUP);
-        let _ = nix::sys::wait::waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        // Reaping can take up to the grace period; keep it off the runtime.
+        let pid = self.child_pid;
+        std::thread::spawn(move || terminate_and_reap(pid));
     }
+}
+
+/// How long a hung-up tmux client gets to exit before SIGKILL.
+const HANGUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Hang up the tmux client and reap it, escalating to SIGKILL if it ignores
+/// SIGHUP. Blocks until the child is reaped, so call it off the runtime.
+///
+/// A single WNOHANG wait right after SIGHUP almost always runs before the
+/// child has exited, which left a zombie behind for every closed tab.
+pub(crate) fn terminate_and_reap(pid: Pid) {
+    if kill(pid, Signal::SIGHUP).is_err() {
+        // Already reaped (or never ours) — nothing to wait for.
+        return;
+    }
+    let deadline = Instant::now() + HANGUP_GRACE;
+    while Instant::now() < deadline {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => std::thread::sleep(Duration::from_millis(20)),
+            _ => return,
+        }
+    }
+    // The zombie-to-be holds the PID until reaped, so this can't hit a reused PID.
+    let _ = kill(pid, Signal::SIGKILL);
+    let _ = waitpid(pid, None);
 }
 
 impl AsyncRead for PtyMaster {
@@ -241,4 +269,53 @@ fn user_name_from_uid(uid: Uid) -> String {
         .flatten()
         .map(|u| u.name)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminate_and_reap;
+    use nix::unistd::Pid;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    /// A reaped child has no /proc entry; a zombie still does (state Z).
+    fn is_gone(pid: Pid) -> bool {
+        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Spawn `script` and wait until it prints its first line, so any traps
+    /// it sets are installed before the test signals it.
+    fn spawn(script: &str) -> Pid {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        // Dropping std's Child does not wait; terminate_and_reap owns reaping.
+        Pid::from_raw(child.id() as i32)
+    }
+
+    #[test]
+    fn hung_up_child_is_reaped_not_left_a_zombie() {
+        let pid = spawn("echo ready; exec sleep 30");
+        terminate_and_reap(pid);
+        assert!(
+            is_gone(pid),
+            "child {pid} left behind after terminate_and_reap"
+        );
+    }
+
+    #[test]
+    fn child_ignoring_sighup_is_killed_and_reaped() {
+        let pid = spawn("trap '' HUP; echo ready; exec sleep 30");
+        terminate_and_reap(pid);
+        assert!(
+            is_gone(pid),
+            "SIGHUP-ignoring child {pid} survived terminate_and_reap"
+        );
+    }
 }
