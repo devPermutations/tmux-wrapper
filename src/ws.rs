@@ -1,4 +1,4 @@
-use crate::auth::JwksCache;
+use crate::auth::{JwksCache, until_expiry};
 use crate::config::{Config, UserConfig};
 use crate::pty::PtyMaster;
 use crate::user::ResolvedUser;
@@ -21,6 +21,10 @@ use tracing::{error, info, warn};
 /// Distinct from the tmux-session cap, which is configurable via
 /// `[terminal] max_sessions_per_user`.
 const MAX_CONCURRENT_CONNECTIONS_PER_USER: usize = 5;
+
+/// Close code sent when the Cloudflare Access session behind a live socket
+/// lapses. The frontend reloads, which bounces through the Access login.
+const CLOSE_CODE_SESSION_EXPIRED: u16 = 4001;
 
 /// Close code used when the server refuses the socket (a connection or
 /// session limit, or no tmux server to attach to). The reason text is
@@ -108,6 +112,8 @@ struct AuthIdentity {
     /// Display string for logs.
     display_name: String,
     user_config: UserConfig,
+    /// When the Access session lapses (JWT `exp`, unix seconds).
+    expires_at: u64,
 }
 
 /// Extract and verify the Cloudflare Access JWT, return identity on success.
@@ -147,6 +153,7 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthIdent
         display_name: mask_email(&claims.email),
         key: claims.email,
         user_config,
+        expires_at: claims.exp,
     })
 }
 
@@ -289,6 +296,7 @@ pub async fn ws_handler(
             identity.display_name,
             identity.user_config,
             session_name,
+            identity.expires_at,
         )
     })
     .into_response()
@@ -379,6 +387,7 @@ async fn handle_socket(
     display_name: String,
     user_config: UserConfig,
     session_name: Option<String>,
+    expires_at: u64,
 ) {
     // Atomic check + increment of the per-user WebSocket connection count
     {
@@ -469,10 +478,17 @@ async fn handle_socket(
     };
 
     let session_label = resolved.tmux_session.clone();
+    // Authentication happens once, at upgrade; without a deadline a socket
+    // would outlive the Access session indefinitely (pings keep it alive).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
     run_bridge(
         socket,
         pty,
         state.config.terminal.ping_interval_secs,
+        until_expiry(expires_at, now),
         &display_name,
         &session_label,
     )
@@ -514,6 +530,7 @@ async fn run_bridge(
     mut socket: WebSocket,
     pty: PtyMaster,
     ping_interval_secs: u64,
+    expires_in: Duration,
     user: &str,
     session: &str,
 ) {
@@ -531,8 +548,20 @@ async fn run_bridge(
     let session1 = session.clone();
     let mut ws_task = tokio::spawn(async move {
         let mut ping_ticker = interval(Duration::from_secs(ping_interval_secs));
+        let expiry = tokio::time::sleep(expires_in);
+        tokio::pin!(expiry);
         loop {
             tokio::select! {
+                _ = &mut expiry => {
+                    info!(user = %user1, session = %session1, "Access session expired — closing socket");
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CLOSE_CODE_SESSION_EXPIRED,
+                            reason: "session expired".into(),
+                        })))
+                        .await;
+                    break;
+                }
                 msg = socket.recv() => {
                     match msg {
                         Some(Ok(Message::Binary(data))) => {

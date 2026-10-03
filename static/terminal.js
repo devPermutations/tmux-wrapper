@@ -81,16 +81,29 @@
     const newSessionInput = document.getElementById('new-session-name');
     const newSessionBtn = document.getElementById('new-session-btn');
 
+    // An expired Access session never reaches the server: Cloudflare answers
+    // with a cross-origin 302 to its login page, which fetch can't follow
+    // (it would fail as a network error). With redirect: 'manual' that shows
+    // up as an opaque redirect we can recognise.
+    function isAccessExpired(resp) {
+        return resp.type === 'opaqueredirect' || resp.status === 401;
+    }
+
+    // A full reload is a top-level navigation, which Cloudflare redirects to
+    // its login page and back.
+    function reauthenticate() {
+        showOverlay('Session expired \u2014 signing in again\u2026');
+        setTimeout(function () { location.reload(); }, 1500);
+    }
+
     async function fetchSessions() {
         try {
-            const resp = await fetch('/api/sessions');
+            const resp = await fetch('/api/sessions', { redirect: 'manual' });
+            if (isAccessExpired(resp)) {
+                reauthenticate();
+                return null;
+            }
             if (!resp.ok) {
-                if (resp.status === 401) {
-                    // Cloudflare Access token missing/expired — a full reload
-                    // bounces through CF Access and re-authenticates.
-                    showOverlay('Session expired — reload the page');
-                    return null;
-                }
                 if (resp.status === 403) {
                     showOverlay('Access denied');
                     return null;
@@ -311,6 +324,11 @@
         };
 
         ws.onclose = function (event) {
+            if (event.code === 4001) {
+                // The server closes live sockets when the Access session lapses.
+                reauthenticate();
+                return;
+            }
             if (event.code === 4004) {
                 // Server refused: connection or session limit reached.
                 // Show the reason, then return to the picker so the user
@@ -330,7 +348,18 @@
 
     function scheduleReconnect() {
         showOverlay('Reconnecting...');
-        setTimeout(function () {
+        setTimeout(async function () {
+            // A failed upgrade looks the same whether the network dropped or
+            // Access redirected it to login, so ask before retrying.
+            try {
+                const probe = await fetch('/api/sessions', { redirect: 'manual' });
+                if (isAccessExpired(probe)) {
+                    reauthenticate();
+                    return;
+                }
+            } catch (e) {
+                // offline — just retry the socket
+            }
             connect();
             reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
         }, reconnectDelay);
