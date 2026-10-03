@@ -1,4 +1,5 @@
 use crate::user::ResolvedUser;
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::libc;
 use nix::pty::openpty;
 use nix::sys::signal::{self, Signal, kill};
@@ -7,7 +8,9 @@ use nix::unistd::{ForkResult, Pid, Uid, fork, setsid};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
@@ -15,7 +18,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub struct PtyMaster {
     async_fd: AsyncFd<OwnedFd>,
-    child_pid: Pid,
+    /// Only the legacy `spawn` path owns a child; `from_fd` masters do not.
+    child_pid: Option<Pid>,
 }
 
 impl PtyMaster {
@@ -48,7 +52,7 @@ impl PtyMaster {
 
                 Ok(PtyMaster {
                     async_fd,
-                    child_pid: child,
+                    child_pid: Some(child),
                 })
             }
             ForkResult::Child => {
@@ -147,6 +151,29 @@ impl PtyMaster {
         }
     }
 
+    /// Wrap an already-open PTY master (e.g. received from the helper). The
+    /// child is not ours, so nothing is reaped on drop.
+    #[allow(dead_code)] // Used by the helper client (Task 5).
+    pub fn from_fd(fd: OwnedFd) -> io::Result<PtyMaster> {
+        set_nonblocking(&fd)?;
+        Ok(PtyMaster {
+            async_fd: AsyncFd::new(fd)?,
+            child_pid: None,
+        })
+    }
+
+    /// Set the terminal size via TIOCSWINSZ on the master.
+    #[allow(dead_code)] // Used by the helper client (Task 5).
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe { libc::ioctl(self.raw_fd(), libc::TIOCSWINSZ, &ws) };
+    }
+
     pub fn raw_fd(&self) -> RawFd {
         self.async_fd.get_ref().as_raw_fd()
     }
@@ -155,9 +182,65 @@ impl PtyMaster {
 impl Drop for PtyMaster {
     fn drop(&mut self) {
         // Reaping can take up to the grace period; keep it off the runtime.
-        let pid = self.child_pid;
-        std::thread::spawn(move || terminate_and_reap(pid));
+        if let Some(pid) = self.child_pid {
+            std::thread::spawn(move || terminate_and_reap(pid));
+        }
     }
+}
+
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+    let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
+    Ok(())
+}
+
+/// Spawn `tmux new-session -A -s <session>` attached to a fresh PTY, as the
+/// current user (no sudo). Returns the PTY master and the client process.
+/// Must be called from within a tokio runtime. Dropping the master hangs the
+/// client up, so `child.wait()` then completes.
+#[allow(dead_code)] // Called by the helper (Task 4).
+pub fn spawn_tmux_client(
+    session: &str,
+    home: &Path,
+    socket: Option<&Path>,
+) -> io::Result<(OwnedFd, tokio::process::Child)> {
+    let pty = openpty(None, None).map_err(io::Error::from)?;
+    let (master, slave) = (pty.master, pty.slave);
+    // The child must not inherit the master, or dropping ours would never hang it up.
+    fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
+    fcntl(&slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
+
+    let mut cmd = tokio::process::Command::new("/usr/bin/tmux");
+    if let Some(sock) = socket {
+        cmd.arg("-S").arg(sock);
+    }
+    cmd.args(["new-session", "-A", "-s", session, "-c"])
+        .arg(home)
+        .current_dir(home)
+        .env("TERM", "xterm-256color")
+        .env_remove("TMUX")
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave));
+    // Safety: runs in the forked child; only async-signal-safe calls
+    // (setsid, ioctl), no allocation, locks or std I/O.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn();
+    // Drop the Command (and the parent's slave copies it owns) before returning,
+    // on success and failure alike.
+    drop(cmd);
+    Ok((master, child?))
 }
 
 /// How long a hung-up tmux client gets to exit before SIGKILL.
@@ -273,10 +356,13 @@ fn user_name_from_uid(uid: Uid) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::terminate_and_reap;
+    use super::{PtyMaster, spawn_tmux_client, terminate_and_reap};
+    use crate::test_support::ScratchTmux;
     use nix::unistd::Pid;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
 
     /// A reaped child has no /proc entry; a zombie still does (state Z).
     fn is_gone(pid: Pid) -> bool {
@@ -316,6 +402,46 @@ mod tests {
         assert!(
             is_gone(pid),
             "SIGHUP-ignoring child {pid} survived terminate_and_reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn tmux_client_gets_a_pty_and_exits_when_master_drops() {
+        let Some(t) = ScratchTmux::start("base") else {
+            eprintln!("skipping: /usr/bin/tmux not available");
+            return;
+        };
+        let home = std::env::temp_dir();
+        let (master, mut child) = spawn_tmux_client("t1", &home, Some(t.socket())).unwrap();
+        let mut pty = PtyMaster::from_fd(master).unwrap();
+
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), pty.read(&mut buf))
+            .await
+            .expect("no output within 2s")
+            .unwrap();
+        assert!(n > 0, "expected terminal output from tmux client");
+
+        pty.resize(100, 30);
+
+        let sessions = crate::tmux::list_sessions(Some(t.socket())).await;
+        assert!(sessions.iter().any(|s| s.name == "t1"), "{sessions:?}");
+
+        drop(pty);
+        tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .expect("client did not exit after master drop")
+            .unwrap();
+
+        assert!(
+            crate::tmux::kill_session("t1", Some(t.socket()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::tmux::kill_session("t1", Some(t.socket()))
+                .await
+                .unwrap()
         );
     }
 }

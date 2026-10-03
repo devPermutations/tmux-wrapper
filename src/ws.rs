@@ -1,6 +1,7 @@
 use crate::auth::{JwksCache, until_expiry};
 use crate::config::{Config, UserConfig};
 use crate::pty::PtyMaster;
+use crate::tmux::{TmuxServer, classify_list_sessions, is_valid_session_name, refuses_new_session};
 use crate::user::ResolvedUser;
 use axum::Json;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -30,43 +31,6 @@ const CLOSE_CODE_SESSION_EXPIRED: u16 = 4001;
 /// session limit, or no tmux server to attach to). The reason text is
 /// surfaced verbatim by the frontend.
 const CLOSE_CODE_REFUSED: u16 = 4004;
-
-/// Session names may only contain [a-zA-Z0-9_-].
-fn is_valid_session_name(name: &str) -> bool {
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-/// Tmux-session cap decision: refuse only when the requested name is NEW and
-/// the user is already at the cap. Attaching to an existing session is always
-/// allowed regardless of the cap.
-fn refuses_new_session(existing: &[String], requested: &str, cap: usize) -> bool {
-    !existing.iter().any(|s| s == requested) && existing.len() >= cap
-}
-
-/// What `tmux list-sessions` (run as the user) says about their tmux server.
-#[derive(Debug, PartialEq)]
-enum TmuxServer {
-    Running(Vec<String>),
-    NotRunning,
-    /// The listing failed for some other reason (e.g. sudo misconfigured).
-    Unknown,
-}
-
-fn classify_list_sessions(success: bool, stdout: &str, stderr: &str) -> TmuxServer {
-    if success {
-        return TmuxServer::Running(stdout.lines().map(str::to_string).collect());
-    }
-    // tmux 3.4: a stale socket says "no server running on <path>"; a missing
-    // one says "error connecting to <path> (No such file or directory)".
-    let no_socket = stderr.contains("error connecting")
-        && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"));
-    if stderr.contains("no server running") || no_socket {
-        TmuxServer::NotRunning
-    } else {
-        TmuxServer::Unknown
-    }
-}
 
 /// Mask email for logging: "user@example.com" → "us***@example.com"
 fn mask_email(email: &str) -> String {
@@ -680,93 +644,12 @@ async fn run_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TmuxServer, classify_list_sessions, is_valid_session_name, mask_email, refuses_new_session,
-    };
-
-    #[test]
-    fn session_names_allow_alphanumeric_underscore_dash() {
-        assert!(is_valid_session_name("main"));
-        assert!(is_valid_session_name("my-session_2"));
-        assert!(is_valid_session_name("A1"));
-    }
-
-    #[test]
-    fn session_names_reject_shell_and_path_metacharacters() {
-        assert!(!is_valid_session_name("main session"));
-        assert!(!is_valid_session_name("../etc"));
-        assert!(!is_valid_session_name("a;rm -rf"));
-        assert!(!is_valid_session_name("a|b"));
-        assert!(!is_valid_session_name("a$b"));
-        assert!(!is_valid_session_name("a.b"));
-    }
-
-    #[test]
-    fn session_names_reject_non_ascii_alphanumerics() {
-        // is_alphanumeric() would accept these; the contract is [A-Za-z0-9_-].
-        assert!(!is_valid_session_name("café"));
-        assert!(!is_valid_session_name("名前"));
-    }
-
-    #[test]
-    fn new_session_under_cap_is_allowed() {
-        let existing = vec!["a".to_string(), "b".to_string()];
-        assert!(!refuses_new_session(&existing, "c", 3));
-    }
-
-    #[test]
-    fn new_session_at_cap_is_refused() {
-        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert!(refuses_new_session(&existing, "d", 3));
-    }
-
-    #[test]
-    fn attach_to_existing_session_at_cap_is_allowed() {
-        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert!(!refuses_new_session(&existing, "b", 3));
-    }
+    use super::mask_email;
 
     #[test]
     fn mask_email_hides_local_part() {
         assert_eq!(mask_email("user@example.com"), "us***@example.com");
         assert_eq!(mask_email("ab@example.com"), "ab***@example.com");
         assert_eq!(mask_email("not-an-email"), "***");
-    }
-
-    #[test]
-    fn listing_with_sessions_means_running() {
-        assert_eq!(
-            classify_list_sessions(true, "main\nwork\n", ""),
-            TmuxServer::Running(vec!["main".into(), "work".into()])
-        );
-    }
-
-    #[test]
-    fn missing_socket_means_not_running() {
-        let stderr = "error connecting to /tmp/tmux-1000/default (No such file or directory)\n";
-        assert_eq!(
-            classify_list_sessions(false, "", stderr),
-            TmuxServer::NotRunning
-        );
-    }
-
-    #[test]
-    fn stale_socket_means_not_running() {
-        let stderr = "no server running on /tmp/tmux-1000/default\n";
-        assert_eq!(
-            classify_list_sessions(false, "", stderr),
-            TmuxServer::NotRunning
-        );
-    }
-
-    #[test]
-    fn other_failures_are_unknown() {
-        let denied = "error connecting to /tmp/tmux-1000/default (Permission denied)\n";
-        assert_eq!(
-            classify_list_sessions(false, "", denied),
-            TmuxServer::Unknown
-        );
-        let sudo = "sudo: unknown user ghost\n";
-        assert_eq!(classify_list_sessions(false, "", sudo), TmuxServer::Unknown);
     }
 }

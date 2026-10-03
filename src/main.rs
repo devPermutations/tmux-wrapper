@@ -4,6 +4,7 @@ mod proto;
 mod pty;
 #[cfg(test)]
 mod test_support;
+mod tmux;
 mod user;
 mod ws;
 
