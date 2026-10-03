@@ -125,12 +125,46 @@ fn status_field(pid: u32, field: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-fn first_uid(pid: u32) -> Option<u32> {
-    status_field(pid, "Uid")?
+/// All ids on a `Uid:` / `Gid:` line: real, effective, saved, filesystem.
+fn ids(pid: u32, field: &str) -> Vec<u32> {
+    status_field(pid, field)
+        .unwrap_or_else(|| panic!("no {field} for pid {pid}"))
         .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+        .map(|v| v.parse().expect("numeric id"))
+        .collect()
+}
+
+fn assert_ids(pid: u32, field: &str, want: u32, who: &str) {
+    assert_eq!(
+        ids(pid, field),
+        vec![want; 4],
+        "{who}: every {field} field (real, effective, saved, fs) must be {want}"
+    );
+}
+
+fn assert_no_caps(pid: u32, who: &str) {
+    for field in ["CapPrm", "CapEff"] {
+        let cap = status_field(pid, field).unwrap_or_else(|| panic!("no {field}"));
+        assert_eq!(
+            u64::from_str_radix(&cap, 16).unwrap(),
+            0,
+            "{who}: {field} must be 0"
+        );
+    }
+}
+
+/// Every process whose parent is in `parents`, with its `State:` line. Scans
+/// /proc rather than cgroup.procs: the kernel leaves zombies out of the latter.
+fn children_of(parents: &[u32]) -> Vec<(u32, u32, String)> {
+    std::fs::read_dir("/proc")
+        .expect("read /proc")
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let ppid: u32 = status_field(pid, "PPid")?.parse().ok()?;
+            let state = status_field(pid, "State")?;
+            parents.contains(&ppid).then_some((pid, ppid, state))
+        })
+        .collect()
 }
 
 fn cgroup_pids() -> Vec<u32> {
@@ -170,32 +204,37 @@ async fn process_model() {
     expect_output(&mut ws, "up-2", 5).await;
 
     let main = main_pid();
-    let nobody = id_of("-u", "nobody");
-    assert_eq!(first_uid(main), Some(nobody), "front must run as nobody");
+    assert_ids(main, "Uid", id_of("-u", "nobody"), "front");
+    assert_ids(main, "Gid", id_of("-g", "nobody"), "front");
     assert_eq!(
         status_field(main, "Groups").as_deref(),
         Some(""),
         "front must have no supplementary groups"
     );
-    let cap = status_field(main, "CapEff").unwrap();
-    assert_eq!(
-        u64::from_str_radix(&cap, 16).unwrap(),
-        0,
-        "front CapEff must be 0"
-    );
+    assert_no_caps(main, "front");
 
     let helper = helper_pid(main);
-    assert_eq!(first_uid(helper), Some(id_of("-u", "ktulu")));
-    let gid = id_of("-g", "ktulu").to_string();
+    let gid = id_of("-g", "ktulu");
+    assert_ids(helper, "Uid", id_of("-u", "ktulu"), "helper");
+    assert_ids(helper, "Gid", gid, "helper");
     assert_eq!(
         status_field(helper, "Groups").as_deref(),
-        Some(gid.as_str()),
+        Some(gid.to_string().as_str()),
         "helper must carry only the primary gid"
     );
+    assert_no_caps(helper, "helper");
 
-    for pid in cgroup_pids() {
-        if let Some(uid) = first_uid(pid) {
-            assert_ne!(uid, 0, "pid {pid} in the unit's cgroup runs as root");
+    let cgroup = cgroup_pids();
+    assert!(
+        cgroup.contains(&main) && cgroup.contains(&helper),
+        "cgroup scan {cgroup:?} must contain main {main} and helper {helper}"
+    );
+    for pid in cgroup {
+        if let Some(uid) = status_field(pid, "Uid") {
+            assert!(
+                uid.split_whitespace().all(|id| id != "0"),
+                "pid {pid} in the unit's cgroup has a root uid: {uid}"
+            );
         }
     }
     let _ = ws.close(None).await;
@@ -289,11 +328,31 @@ async fn socket_closes_4001_when_token_expires() {
 #[tokio::test]
 #[ignore]
 async fn no_zombies_after_sockets_close() {
+    let main = main_pid();
+    let helper = helper_pid(main);
+
+    // With a terminal open the scan must see the helper's tmux client, so
+    // the check below cannot pass by finding nothing.
+    let mut ws = ws_connect("e2e-a", &good_token()).await;
+    send_line(&mut ws, "echo open-$((2+3))\r").await;
+    expect_output(&mut ws, "open-5", 5).await;
+    let open = children_of(&[helper]);
+    assert!(
+        !open.is_empty(),
+        "no child of helper {helper} found while a terminal is open"
+    );
+    let _ = ws.close(None).await;
     ensure_session_a().await;
     sleep(Duration::from_secs(3)).await;
-    for pid in cgroup_pids() {
-        if let Some(state) = status_field(pid, "State") {
-            assert!(!state.starts_with('Z'), "pid {pid} is a zombie: {state}");
-        }
-    }
+
+    let mut parents = cgroup_pids();
+    parents.extend([main, helper]);
+    let zombies: Vec<_> = children_of(&parents)
+        .into_iter()
+        .filter(|(_, _, state)| state.starts_with('Z'))
+        .collect();
+    assert!(
+        zombies.is_empty(),
+        "zombies (pid, ppid, state) after sockets closed: {zombies:?}"
+    );
 }
