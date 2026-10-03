@@ -28,8 +28,13 @@ pub struct Claims {
     pub sub: String,
     #[allow(dead_code)]
     pub aud: serde_json::Value,
-    #[allow(dead_code)]
     pub exp: u64,
+}
+
+/// Time left until a token with expiry `exp` (unix seconds) lapses, as of
+/// `now` (unix seconds). Zero if it already has.
+pub(crate) fn until_expiry(exp: u64, now: u64) -> Duration {
+    Duration::from_secs(exp.saturating_sub(now))
 }
 
 /// Retry delay after the `n`th consecutive failed JWKS fetch
@@ -160,7 +165,19 @@ impl JwksCache {
 
 #[cfg(test)]
 mod tests {
-    use super::backoff_secs;
+    use super::{backoff_secs, until_expiry};
+    use std::time::Duration;
+
+    #[test]
+    fn expiry_in_the_future_is_the_remaining_time() {
+        assert_eq!(until_expiry(1_000_090, 1_000_000), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn expired_or_expiring_now_is_zero() {
+        assert_eq!(until_expiry(1_000_000, 1_000_000), Duration::ZERO);
+        assert_eq!(until_expiry(999_000, 1_000_000), Duration::ZERO);
+    }
 
     #[test]
     fn backoff_doubles_from_five_seconds_and_caps_at_sixty() {
