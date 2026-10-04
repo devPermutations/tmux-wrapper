@@ -138,8 +138,9 @@ fn take_scm_rights(buf: &[u8]) -> Vec<OwnedFd> {
         }
         if h.cmsg_level == SOL_SOCKET && h.cmsg_type == SCM_RIGHTS {
             let data = &buf[(off + hdr_data).min(off + len)..off + len];
-            for c in data.chunks_exact(std::mem::size_of::<c_int>()) {
-                let raw = c_int::from_ne_bytes(c.try_into().unwrap());
+            let (chunks, _) = data.as_chunks::<{ std::mem::size_of::<c_int>() }>();
+            for c in chunks {
+                let raw = c_int::from_ne_bytes(*c);
                 // SAFETY: the kernel installed this fd in our table for us.
                 fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
             }
