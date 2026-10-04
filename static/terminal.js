@@ -324,12 +324,13 @@
         };
 
         ws.onclose = function (event) {
-            if (event.code === 4001) {
+            var action = CloseAction.closeAction(event.code, event.reason);
+            if (action === 'reauthenticate') {
                 // The server closes live sockets when the Access session lapses.
                 reauthenticate();
                 return;
             }
-            if (event.code === 4004) {
+            if (action === 'picker') {
                 // Server refused: connection or session limit reached.
                 // Show the reason, then return to the picker so the user
                 // can kill an old session.
@@ -340,14 +341,20 @@
                 }, 3000);
                 return;
             }
+            if (action === 'retry') {
+                // Refused only until the helper's auth keys load (just after
+                // a restart): keep the reason up and reconnect.
+                scheduleReconnect(event.reason);
+                return;
+            }
             scheduleReconnect();
         };
 
         ws.onerror = function () {};
     }
 
-    function scheduleReconnect() {
-        showOverlay('Reconnecting...');
+    function scheduleReconnect(message) {
+        showOverlay(message || 'Reconnecting...');
         setTimeout(async function () {
             // A failed upgrade looks the same whether the network dropped or
             // Access redirected it to login, so ask before retrying.

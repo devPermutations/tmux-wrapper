@@ -1,3 +1,4 @@
+use crate::config::UserConfig;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::Client;
 use serde::Deserialize;
@@ -31,6 +32,11 @@ pub struct Claims {
     pub exp: u64,
 }
 
+/// True iff the verified token's email is this user's, ignoring ASCII case.
+pub(crate) fn token_grants(user: &UserConfig, claims: &Claims) -> bool {
+    claims.email.eq_ignore_ascii_case(&user.email)
+}
+
 /// Time left until a token with expiry `exp` (unix seconds) lapses, as of
 /// `now` (unix seconds). Zero if it already has.
 pub(crate) fn until_expiry(exp: u64, now: u64) -> Duration {
@@ -57,7 +63,7 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
-    pub fn new(team_domain: &str, audience: &str) -> Self {
+    pub fn new(jwks_url: &str, issuer: &str, audience: &str) -> Self {
         Self {
             keys: Arc::new(RwLock::new(Vec::new())),
             // Explicit timeouts: a hung fetch would otherwise stall the
@@ -67,10 +73,18 @@ impl JwksCache {
                 .connect_timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build JWKS HTTP client"),
-            jwks_url: format!("https://{team_domain}.cloudflareaccess.com/cdn-cgi/access/certs"),
+            jwks_url: jwks_url.to_string(),
             audience: audience.to_string(),
-            issuer: format!("https://{team_domain}.cloudflareaccess.com"),
+            issuer: issuer.to_string(),
         }
+    }
+
+    /// Test constructor: fixed keys, no network fetch.
+    #[cfg(test)]
+    pub fn with_static_keys(keys: Vec<DecodingKey>, issuer: &str, audience: &str) -> Self {
+        let cache = Self::new("http://127.0.0.1:1/unused", issuer, audience);
+        *cache.keys.try_write().expect("fresh cache is unlocked") = keys;
+        cache
     }
 
     pub async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -102,7 +116,7 @@ impl JwksCache {
         Ok(())
     }
 
-    async fn has_keys(&self) -> bool {
+    pub(crate) async fn has_keys(&self) -> bool {
         !self.keys.read().await.is_empty()
     }
 
@@ -165,8 +179,87 @@ impl JwksCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_secs, until_expiry};
-    use std::time::Duration;
+    use super::{Claims, JwksCache, backoff_secs, token_grants, until_expiry};
+    use crate::config::UserConfig;
+    use crate::test_support;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const ISS: &str = "https://test.example";
+    const AUD: &str = "aud-1";
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn user(email: &str) -> UserConfig {
+        UserConfig {
+            email: email.into(),
+            unix_user: "alice".into(),
+            tmux_session: "main".into(),
+        }
+    }
+
+    fn claims(email: &str) -> Claims {
+        Claims {
+            email: email.into(),
+            sub: "s".into(),
+            aud: serde_json::Value::Null,
+            exp: 0,
+        }
+    }
+
+    #[test]
+    fn token_grants_matches_email_ignoring_case() {
+        assert!(token_grants(
+            &user("virgil@gmail.com"),
+            &claims("virgil@gmail.com")
+        ));
+        assert!(token_grants(
+            &user("virgil@gmail.com"),
+            &claims("Virgil@Gmail.com")
+        ));
+        assert!(!token_grants(
+            &user("virgil@gmail.com"),
+            &claims("other@gmail.com")
+        ));
+    }
+
+    #[tokio::test]
+    async fn static_keys_verify_a_good_token() {
+        let Some((_, dec)) = test_support::keys() else {
+            eprintln!("skipping: openssl unavailable");
+            return;
+        };
+        let cache = JwksCache::with_static_keys(vec![dec], ISS, AUD);
+        assert!(cache.has_keys().await);
+        let tok = test_support::mint("a@b.com", AUD, ISS, now() + 300).unwrap();
+        assert_eq!(cache.verify(&tok).await.unwrap().email, "a@b.com");
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_fails() {
+        let Some((_, dec)) = test_support::keys() else {
+            eprintln!("skipping: openssl unavailable");
+            return;
+        };
+        let cache = JwksCache::with_static_keys(vec![dec], ISS, AUD);
+        let tok = test_support::mint("a@b.com", "other-aud", ISS, now() + 300).unwrap();
+        assert!(cache.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_token_fails() {
+        let Some((_, dec)) = test_support::keys() else {
+            eprintln!("skipping: openssl unavailable");
+            return;
+        };
+        let cache = JwksCache::with_static_keys(vec![dec], ISS, AUD);
+        let tok = test_support::mint("a@b.com", AUD, ISS, now() - 3600).unwrap();
+        assert!(cache.verify(&tok).await.is_err());
+    }
 
     #[test]
     fn expiry_in_the_future_is_the_remaining_time() {

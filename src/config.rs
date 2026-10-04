@@ -5,10 +5,17 @@ fn default_listen() -> String {
     "127.0.0.1:7681".to_string()
 }
 
+fn default_run_as() -> String {
+    "tmuxwrapper".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// System user the unprivileged front runs as.
+    #[serde(default = "default_run_as")]
+    pub run_as: String,
     pub static_dir: String,
     pub cloudflare: CloudflareConfig,
     pub terminal: TerminalConfig,
@@ -20,6 +27,29 @@ pub struct CloudflareConfig {
     pub team_domain: String,
     pub audience: String,
     pub jwks_refresh_secs: u64,
+    /// Testing only: override the JWKS endpoint (https or loopback http).
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// Testing only: override the expected token issuer.
+    #[serde(default)]
+    pub issuer: Option<String>,
+}
+
+impl CloudflareConfig {
+    pub fn resolved_jwks_url(&self) -> String {
+        self.jwks_url.clone().unwrap_or_else(|| {
+            format!(
+                "https://{}.cloudflareaccess.com/cdn-cgi/access/certs",
+                self.team_domain
+            )
+        })
+    }
+
+    pub fn resolved_issuer(&self) -> String {
+        self.issuer
+            .clone()
+            .unwrap_or_else(|| format!("https://{}.cloudflareaccess.com", self.team_domain))
+    }
 }
 
 fn default_max_sessions_per_user() -> usize {
@@ -58,6 +88,16 @@ impl Config {
         self.listen
             .parse::<std::net::SocketAddr>()
             .map_err(|e| format!("invalid listen address '{}': {}", self.listen, e))?;
+        let mut run_as_chars = self.run_as.chars();
+        let run_as_ok = matches!(run_as_chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+            && run_as_chars
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !run_as_ok || self.run_as == "root" {
+            return Err(format!(
+                "run_as '{}' is invalid or not allowed (must be non-root, [a-z_][a-z0-9_-]*)",
+                self.run_as
+            ));
+        }
         if !Path::new(&self.static_dir).is_dir() {
             return Err(format!(
                 "static_dir '{}' does not exist or is not a directory",
@@ -81,6 +121,26 @@ impl Config {
                 "cloudflare.audience is still a placeholder — set it to your CF Access AUD tag"
                     .into(),
             );
+        }
+
+        if let Some(url) = &cf.jwks_url {
+            let ok = reqwest::Url::parse(url).is_ok_and(|u| {
+                u.username().is_empty()
+                    && u.password().is_none()
+                    && match u.scheme() {
+                        "https" => u.host_str().is_some(),
+                        "http" => matches!(
+                            u.host_str(),
+                            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+                        ),
+                        _ => false,
+                    }
+            });
+            if !ok {
+                return Err(format!(
+                    "cloudflare.jwks_url '{url}' must be https:// or loopback http://"
+                ));
+            }
         }
 
         for user in &self.users {
@@ -112,6 +172,23 @@ impl Config {
                     user.tmux_session
                 ));
             }
+        }
+        // Helpers are keyed by unix_user (one forked helper per user).
+        let mut seen = std::collections::HashSet::new();
+        for user in &self.users {
+            if !seen.insert(user.unix_user.as_str()) {
+                return Err(format!(
+                    "unix_user '{}' is configured more than once",
+                    user.unix_user
+                ));
+            }
+        }
+        // The front must not be the account it is isolated from.
+        if seen.contains(self.run_as.as_str()) {
+            return Err(format!(
+                "run_as '{}' is also a configured unix_user — use a dedicated system user",
+                self.run_as
+            ));
         }
         Ok(())
     }
@@ -286,5 +363,111 @@ tmux_session = "main"
             "alice"
         );
         assert!(config.find_user("intruder@example.com").is_none());
+    }
+
+    #[test]
+    fn resolved_urls_default_to_cloudflare() {
+        let config = Config::from_toml_str(VALID).unwrap();
+        assert_eq!(
+            config.cloudflare.resolved_jwks_url(),
+            "https://myteam.cloudflareaccess.com/cdn-cgi/access/certs"
+        );
+        assert_eq!(
+            config.cloudflare.resolved_issuer(),
+            "https://myteam.cloudflareaccess.com"
+        );
+    }
+
+    #[test]
+    fn jwks_and_issuer_overrides_are_used() {
+        let toml = VALID.replace(
+            "jwks_refresh_secs = 3600",
+            "jwks_refresh_secs = 3600\njwks_url = \"http://127.0.0.1:8799/certs\"\nissuer = \"https://test.example\"",
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+        assert_eq!(
+            config.cloudflare.resolved_jwks_url(),
+            "http://127.0.0.1:8799/certs"
+        );
+        assert_eq!(config.cloudflare.resolved_issuer(), "https://test.example");
+    }
+
+    fn with_jwks_url(url: &str) -> String {
+        VALID.replace(
+            "jwks_refresh_secs = 3600",
+            &format!("jwks_refresh_secs = 3600\njwks_url = \"{url}\""),
+        )
+    }
+
+    #[test]
+    fn jwks_url_https_and_loopback_accepted() {
+        for url in [
+            "https://keys.example/certs",
+            "http://127.0.0.1:8799/certs",
+            "http://localhost:8799/certs",
+            "http://[::1]:8799/certs",
+        ] {
+            assert!(Config::from_toml_str(&with_jwks_url(url)).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn jwks_url_plain_http_remote_rejected() {
+        for url in [
+            "http://evil.example/certs",
+            "ftp://127.0.0.1/certs",
+            "http://127.0.0.1.evil.example/certs",
+            "http://localhost.evil.example/certs",
+            "http://127.0.0.1:80@evil.example/",
+            "http://localhost:1@evil.example/",
+            "https://user@keys.example/certs",
+        ] {
+            let err = Config::from_toml_str(&with_jwks_url(url))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("jwks_url"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn run_as_defaults_to_tmuxwrapper() {
+        let config = Config::from_toml_str(VALID).unwrap();
+        assert_eq!(config.run_as, "tmuxwrapper");
+    }
+
+    #[test]
+    fn run_as_is_configurable() {
+        let toml = format!("run_as = \"svc_front-1\"\n{VALID}");
+        assert_eq!(Config::from_toml_str(&toml).unwrap().run_as, "svc_front-1");
+    }
+
+    #[test]
+    fn run_as_root_or_malformed_rejected() {
+        for bad in ["root", "", "Alice", "1abc", "a b", "a;b"] {
+            let toml = format!("run_as = \"{bad}\"\n{VALID}");
+            let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+            assert!(err.contains("run_as"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_unix_user_rejected() {
+        // Helpers are keyed by unix_user: two entries would fork two helpers
+        // and silently keep only one of them.
+        let toml = format!(
+            "{VALID}\n[[users]]\nemail = \"other@example.com\"\nunix_user = \"alice\"\ntmux_session = \"main\"\n"
+        );
+        let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert_eq!(err, "unix_user 'alice' is configured more than once");
+    }
+
+    #[test]
+    fn run_as_equal_to_a_unix_user_rejected() {
+        let toml = format!("run_as = \"alice\"\n{VALID}");
+        let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "run_as 'alice' is also a configured unix_user — use a dedicated system user"
+        );
     }
 }

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.31", features = ["fs", "process", "signal", "term", "user"] }
+nix = { version = "0.31", features = ["fs", "process", "signal", "socket", "term", "uio", "user"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,3 +19,7 @@ tracing-subscriber = "0.3"
 [profile.release]
 strip = true
 lto = true
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+futures-util = "0.3"

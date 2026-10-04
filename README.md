@@ -30,7 +30,7 @@ If you need local password auth or self-hosted TLS, this isn't the project for y
 ## Features
 
 - **Cloudflare Access auth** — JWT verified against your team's JWKS (cached, periodic refresh; failed fetches retry with backoff so a blip at boot doesn't lock everyone out). Open terminals close when the Access session behind them expires, and the client reloads through the Access login instead of looping on reconnect
-- **Email → unix user** — the email in the access JWT maps to a real account on the box, isolated per user via setuid
+- **Email → unix user** — the email in the access JWT maps to a real account on the box. Privilege-separated: the binary starts as root, forks a per-user helper that drops to that user (primary gid only), then drops the network-facing front to an unprivileged `tmuxwrapper` system user. The helper re-verifies every Access JWT itself, and there is no sudo
 - **Tmux per user** — every session attaches to a named tmux session as the target unix user
 - **Session caps** — at most 5 WebSocket connections per user, and a configurable cap on distinct tmux sessions (`max_sessions_per_user`, default 5). Creating a session past the cap is refused with a visible message; attaching to an existing one always works
 - **Systemd-managed** — capability-bounded service that only *attaches*: each user's tmux server runs from their own `tmux-server.service` user unit (see `contrib/`), so panes never inherit the wrapper's sandbox. If a user's server is down (e.g. its last session was killed), the wrapper starts that unit; if it can't, the connection is refused with a visible message rather than starting a sandboxed server
@@ -47,6 +47,15 @@ cargo build --release
 ```
 
 That installs the binary to `/opt/tmuxwrapper/`, copies static assets, and registers the systemd unit. Re-running it upgrades in place: an existing `/opt/tmuxwrapper/config.toml` is kept and a running service is restarted.
+
+Before installing anything, `deploy.sh` copies the currently installed binary, static files and systemd unit (whichever exist) to `/opt/tmuxwrapper.bak-<YYYYmmdd-HHMMSS>/` and prints that path. To undo an upgrade:
+
+```bash
+./rollback.sh                                     # newest /opt/tmuxwrapper.bak-*
+./rollback.sh /opt/tmuxwrapper.bak-20261003-201500  # or a specific backup
+```
+
+`rollback.sh` restores the binary, static files and unit together (an older binary may not run under a newer unit), runs `systemctl daemon-reload`, and restarts the service if it was running. It never touches `config.toml`.
 
 Each unix user in the config needs a tmux server running from a user unit:
 
@@ -79,6 +88,7 @@ Point your CF Access app at the host and visit it from any browser.
 ```toml
 listen = "127.0.0.1:7681"
 static_dir = "./static"
+# run_as = "tmuxwrapper"   # optional; user the front drops to
 
 [cloudflare]
 team_domain = "yourteam"                          # https://yourteam.cloudflareaccess.com
@@ -97,6 +107,10 @@ tmux_session = "main"
 
 Add one `[[users]]` block per allowed user. Emails not in the list are rejected even if their Cloudflare JWT is valid.
 
+`run_as` (default `tmuxwrapper`) is the system user the front process runs as; `deploy.sh` creates it. It must not equal any `unix_user` or share a uid or primary gid with one; startup refuses otherwise. The binary must be started as root and refuses to run otherwise.
+
+For tests only, `[cloudflare]` accepts `jwks_url` and `issuer` overrides. `jwks_url` must be `https`, or `http` on `127.0.0.1`/`localhost`/`::1`, with no userinfo. Leave both unset in production.
+
 ## Cloudflare Access setup
 
 1. Cloudflare dashboard → **Zero Trust** → **Access** → **Applications** → **Add an application** → **Self-hosted**.
@@ -107,20 +121,31 @@ Add one `[[users]]` block per allowed user. Emails not in the list are rejected 
 
 Tunnel the application hostname (`term.example.com`) to `http://127.0.0.1:7681` on your host using `cloudflared` or a sidecar tunnel.
 
-## What runs as root
+## Security model
 
-The binary runs as `root` to `setuid` into the target unix user before spawning the PTY. The systemd unit uses:
+The service starts as root, but the process that faces the network does not stay root:
+
+- **Front** — HTTP/WebSocket handling and the first JWT check run as `run_as` (default `tmuxwrapper`), a no-login system user with no home and no supplementary groups.
+- **Helper** — one per target unix user, forked while still root. It drops to that user (uid and primary gid only, no supplementary groups) and spawns the PTY. It re-verifies every Access JWT itself, so a compromised front can't ask for a terminal as someone it holds no valid token for.
+- **No sudo** — nothing escalates after the drop.
+
+The systemd unit backs this up:
 
 ```
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_FOWNER
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
 ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+LockPersonality=yes
+RestrictRealtime=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 ```
-
-`NoNewPrivileges=no` is required for the setuid path to work. Everything else is locked down.
 
 ## Status
 
