@@ -25,3 +25,12 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo fmt --check
       - run: node --test tests/*.test.js
+
+  # Known advisories in the locked dependency tree fail the build.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

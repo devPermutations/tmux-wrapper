@@ -47,8 +47,10 @@ else
     fresh_config=1
 fi
 
+# Owned by root and read-only to everyone else: the pages run in the logged-in
+# browser, so nothing but a deploy should be able to change them.
 echo "==> Syncing static files"
-sudo rsync -a --delete "$SRC/static/" "$DEST/static/"
+sudo rsync -a --delete --chown=root:root --chmod=D755,F644 "$SRC/static/" "$DEST/static/"
 
 echo "==> Installing systemd service"
 sudo install -m 0644 "$SRC/tmuxwrapper.service" "$UNIT"

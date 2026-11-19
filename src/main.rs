@@ -3,6 +3,8 @@ mod config;
 mod helper;
 mod helper_client;
 mod helper_watch;
+mod notify;
+mod origin;
 mod privdrop;
 mod proto;
 mod pty;
@@ -99,6 +101,21 @@ fn main() {
         .build()
         .unwrap_or_else(|e| fatal(&format!("failed to build tokio runtime: {e}")));
     rt.block_on(run_front(config, helpers));
+}
+
+/// Set the Content-Security-Policy, which names the request's own host as the
+/// only WebSocket endpoint scripts may connect to.
+async fn set_content_security_policy(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let policy = origin::content_security_policy(req.headers());
+    let mut resp = next.run(req).await;
+    if let Ok(value) = axum::http::HeaderValue::from_str(&policy) {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_SECURITY_POLICY, value);
+    }
+    resp
 }
 
 /// Whether this process can read `<static_dir>/index.html`. Checked after the
@@ -206,6 +223,7 @@ fn become_helper(
         PathBuf::from(resolved.home),
         &config.cloudflare,
         config.terminal.max_sessions_per_user,
+        config.notify.as_ref(),
     )
 }
 
@@ -251,12 +269,7 @@ async fn run_front(config: Config, forked: Vec<ForkedHelper>) {
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
-    let csp = SetResponseHeaderLayer::overriding(
-        axum::http::header::CONTENT_SECURITY_POLICY,
-        axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss:; img-src 'self'; media-src 'self' blob:; frame-ancestors 'none'",
-        ),
-    );
+    let csp = axum::middleware::from_fn(set_content_security_policy);
     let nosniff = SetResponseHeaderLayer::overriding(
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),

@@ -1,7 +1,8 @@
 use crate::auth::{JwksCache, until_expiry};
 use crate::config::{Config, UserConfig};
 use crate::helper_client::{HelperClient, HelperDead};
-use crate::proto::{Request, Response as HelperResponse};
+use crate::origin::{client_info, is_same_origin};
+use crate::proto::{ClientInfo, Request, Response as HelperResponse};
 use crate::pty::PtyMaster;
 use crate::tmux::is_valid_session_name;
 use axum::Json;
@@ -80,10 +81,22 @@ struct AuthIdentity {
     /// The verified Access JWT, forwarded to the helper (which re-verifies
     /// it). Never log it.
     token: String,
+    /// Where the edge says the request came from.
+    client: ClientInfo,
 }
 
-/// Extract and verify the Cloudflare Access JWT, return identity on success.
+/// Refuse cross-site browser requests, then extract and verify the Cloudflare
+/// Access JWT; return the identity on success.
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthIdentity, StatusCode> {
+    // The Access cookie is SameSite=None, so it rides along on requests
+    // other sites make; the Origin header is what tells them apart.
+    if !is_same_origin(headers) {
+        let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+        let host = headers.get("host").and_then(|v| v.to_str().ok());
+        warn!(origin = ?origin, host = ?host, "rejected request: origin mismatch");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let token = headers
         .get("Cf-Access-Jwt-Assertion")
         .and_then(|v| v.to_str().ok())
@@ -120,6 +133,7 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthIdent
         key: claims.email,
         user_config,
         token,
+        client: client_info(headers),
     })
 }
 
@@ -219,27 +233,6 @@ pub async fn ws_handler(
     headers: HeaderMap,
     Query(query): Query<WsQuery>,
 ) -> Response {
-    // Origin check (CF Access SameSite=None cookies need server-side CSRF protection).
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        let host = headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        // Extract hostname only (strip scheme and port) for exact comparison
-        let origin_host = origin
-            .strip_prefix("https://")
-            .or_else(|| origin.strip_prefix("http://"))
-            .unwrap_or(origin)
-            .split(':')
-            .next()
-            .unwrap_or("");
-        let host_name = host.split(':').next().unwrap_or("");
-        if origin_host != host_name {
-            warn!(origin = %origin, host = %host, "rejected WebSocket: origin mismatch");
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    }
-
     let identity = match authenticate(&state, &headers).await {
         Ok(v) => v,
         Err(status) => return status.into_response(),
@@ -353,11 +346,20 @@ async fn open_terminal(
     let user = identity.display_name;
     let unix_user = identity.user_config.unix_user;
     let session = session_name.unwrap_or(identity.user_config.tmux_session);
-    info!(user = %user, unix_user = %unix_user, session = %session, "opening terminal");
+    let client = identity.client;
+    info!(
+        user = %user,
+        unix_user = %unix_user,
+        session = %session,
+        client_ip = client.ip.as_deref().unwrap_or("unknown"),
+        client_country = client.country.as_deref().unwrap_or("unknown"),
+        "opening terminal"
+    );
 
     let req = Request::Open {
         token: identity.token,
         session: session.clone(),
+        client,
     };
     let reply = ask_helper(state, &unix_user, &req).await;
     if let Some((resp, fd)) = &reply

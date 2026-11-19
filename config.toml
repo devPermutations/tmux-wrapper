@@ -11,6 +11,15 @@ jwks_refresh_secs = 3600
 ping_interval_secs = 30
 max_sessions_per_user = 5
 
+# Optional: run a command (as the unix user, no shell) when a terminal is
+# opened from an address not seen for quiet_secs. {message} becomes a one-line
+# description; TMUXWRAPPER_SESSION / _CLIENT_IP / _CLIENT_COUNTRY are set too.
+# The service sandbox makes /home read-only, so hand anything that writes
+# there to the user's systemd manager, as below.
+# [notify]
+# command = ["/usr/bin/systemd-run", "--user", "--collect", "--quiet", "/usr/local/bin/notify-me", "{message}"]
+# quiet_secs = 43200
+
 [[users]]
 email = "you@example.com"
 unix_user = "ktulu"

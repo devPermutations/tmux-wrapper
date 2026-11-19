@@ -305,6 +305,7 @@ mod tests {
             jwks: JwksCache::with_static_keys(vec![dec], ISS, AUD),
             max_sessions: 5,
             tmux_socket: Some(t.socket().to_path_buf()),
+            notifier: None,
         };
         let (front, back) = seqpacket_pair().unwrap();
         let helper = tokio::spawn(serve(ctx, AsyncSeqpacket::new(back).unwrap()));
@@ -318,6 +319,7 @@ mod tests {
         let req = Request::Open {
             token: test_support::mint(EMAIL, AUD, ISS, exp).unwrap(),
             session: "base".into(),
+            client: Default::default(),
         };
         let (resp, fd) = client.request(&req).await.unwrap();
         assert_eq!(resp, Response::Opened { expires_at: exp });
