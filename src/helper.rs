@@ -5,8 +5,9 @@
 //! user.
 
 use crate::auth::{Claims, JwksCache, token_grants};
-use crate::config::{CloudflareConfig, UserConfig};
-use crate::proto::{AsyncSeqpacket, Request, Response};
+use crate::config::{CloudflareConfig, NotifyConfig, UserConfig};
+use crate::notify::Notifier;
+use crate::proto::{AsyncSeqpacket, ClientInfo, Request, Response};
 use crate::pty::spawn_tmux_client;
 use crate::tmux::{
     TmuxServer, is_valid_session_name, kill_session, list_sessions, query_server,
@@ -29,6 +30,9 @@ pub struct HelperCtx {
     pub jwks: JwksCache,
     pub max_sessions: usize,
     pub tmux_socket: Option<PathBuf>,
+    /// Announces terminals opened from somewhere new; `None` when no
+    /// `[notify]` command is configured.
+    pub notifier: Option<Notifier>,
 }
 
 /// Verify `token` for this helper's user. `Err` is the reply to send.
@@ -70,7 +74,9 @@ pub async fn handle(ctx: &HelperCtx, req: Request) -> (Response, Option<OwnedFd>
     };
     let socket = ctx.tmux_socket.as_deref();
     match req {
-        Request::Open { session, .. } => open(ctx, &session, claims.exp).await,
+        Request::Open {
+            session, client, ..
+        } => open(ctx, &session, &client, claims.exp).await,
         Request::List { .. } => (
             Response::Sessions {
                 sessions: list_sessions(socket).await,
@@ -96,7 +102,12 @@ pub async fn handle(ctx: &HelperCtx, req: Request) -> (Response, Option<OwnedFd>
     }
 }
 
-async fn open(ctx: &HelperCtx, session: &str, expires_at: u64) -> (Response, Option<OwnedFd>) {
+async fn open(
+    ctx: &HelperCtx,
+    session: &str,
+    client: &ClientInfo,
+    expires_at: u64,
+) -> (Response, Option<OwnedFd>) {
     let refused = |reason: &str| {
         (
             Response::Refused {
@@ -149,6 +160,9 @@ async fn open(ctx: &HelperCtx, session: &str, expires_at: u64) -> (Response, Opt
                 }
             });
             info!(session = %session, "opened terminal");
+            if let Some(notifier) = &ctx.notifier {
+                notifier.terminal_opened(session, client);
+            }
             (Response::Opened { expires_at }, Some(master))
         }
         Err(e) => {
@@ -200,6 +214,7 @@ pub fn run_helper(
     home: PathBuf,
     cloudflare: &CloudflareConfig,
     max_sessions: usize,
+    notify: Option<&NotifyConfig>,
 ) -> ! {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -217,6 +232,7 @@ pub fn run_helper(
         &cloudflare.audience,
     );
     let refresh_secs = cloudflare.jwks_refresh_secs;
+    let notifier = notify.map(Notifier::new);
     rt.block_on(async move {
         let sock = match AsyncSeqpacket::new(sock) {
             Ok(sock) => sock,
@@ -238,6 +254,7 @@ pub fn run_helper(
             jwks,
             max_sessions,
             tmux_socket: None,
+            notifier,
         };
         serve(ctx, sock).await;
     });
@@ -280,6 +297,7 @@ mod tests {
             jwks: JwksCache::with_static_keys(keys, ISS, AUD),
             max_sessions,
             tmux_socket: Some(socket.to_path_buf()),
+            notifier: None,
         }
     }
 
@@ -346,6 +364,7 @@ mod tests {
             Request::Open {
                 token: token.into(),
                 session: name.into(),
+                client: ClientInfo::default(),
             },
             Request::List {
                 token: token.into(),
@@ -478,12 +497,91 @@ mod tests {
             Request::Open {
                 token: tok,
                 session: "fresh".into(),
+                client: ClientInfo::default(),
             },
         )
         .await;
         assert_eq!(resp, Response::Opened { expires_at: exp });
         assert!(read_some(fd.expect("Opened without an fd")).await > 0);
         assert!(session_names(t.socket()).await.contains(&"fresh".into()));
+    }
+
+    /// Opens from one address are announced once per quiet period; a new
+    /// address is announced straight away. The command gets the message as
+    /// an argument and the facts in its environment.
+    #[tokio::test]
+    async fn opens_from_a_new_address_run_the_notify_command_once() {
+        let Some((dec, t)) = setup("base") else {
+            return;
+        };
+        let log = t.socket().with_file_name("notify.log");
+        let mut c = ctx(vec![dec], t.socket(), 5);
+        c.notifier = Some(Notifier::new(&NotifyConfig {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf '%s|%s|%s\n' "$1" "$TMUXWRAPPER_CLIENT_IP" "$TMUXWRAPPER_SESSION" >> "$2""#
+                    .into(),
+                "sh".into(),
+                "{message}".into(),
+                log.to_string_lossy().into_owned(),
+            ],
+            quiet_secs: 3600,
+        }));
+        let open = |ip: &str| Request::Open {
+            token: good_token(),
+            session: "base".into(),
+            client: ClientInfo {
+                ip: Some(ip.into()),
+                country: Some("CA".into()),
+            },
+        };
+        for ip in ["203.0.113.7", "203.0.113.7", "198.51.100.9"] {
+            let (resp, fd) = handle(&c, open(ip)).await;
+            assert!(matches!(resp, Response::Opened { .. }), "{resp:?}");
+            drop(fd);
+        }
+        // A refused request (bad token) is never announced.
+        let (resp, _) = handle(
+            &c,
+            Request::Open {
+                token: "not-a-jwt".into(),
+                session: "base".into(),
+                client: ClientInfo {
+                    ip: Some("192.0.2.1".into()),
+                    country: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(resp, Response::Unauthorized);
+
+        let want = [
+            "Web terminal opened: tmux session 'base' from 203.0.113.7 (CA)|203.0.113.7|base",
+            "Web terminal opened: tmux session 'base' from 198.51.100.9 (CA)|198.51.100.9|base",
+        ];
+        let lines = async {
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                if lines.len() >= want.len() {
+                    lines.sort();
+                    break lines;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let mut lines = tokio::time::timeout(Duration::from_secs(5), lines)
+            .await
+            .expect("notify command did not run twice within 5s");
+        // Give a wrongly-sent third notification time to land.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        lines.sort();
+        assert_eq!(lines, want);
     }
 
     #[tokio::test]
@@ -545,6 +643,7 @@ mod tests {
         let open = |name: &str| Request::Open {
             token: good_token(),
             session: name.into(),
+            client: ClientInfo::default(),
         };
         let (resp, fd) = handle(&c, open("fresh")).await;
         assert_eq!(
@@ -573,6 +672,7 @@ mod tests {
             Request::Open {
                 token: good_token(),
                 session: "fresh".into(),
+                client: ClientInfo::default(),
             },
         )
         .await;
@@ -620,6 +720,7 @@ mod tests {
                 &Request::Open {
                     token: good_token(),
                     session: "base".into(),
+                    client: ClientInfo::default(),
                 },
                 None,
             )

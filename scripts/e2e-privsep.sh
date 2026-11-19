@@ -84,6 +84,13 @@ for _ in $(seq 1 50); do
 done
 curl -fs "http://127.0.0.1:$JWKS_PORT/certs.json" >/dev/null 2>&1 || die "JWKS server not up"
 
+# The login-notification command: appends its argument to a log the tests read.
+cat >"$TMP/notify.sh" <<NOTIFY
+#!/bin/sh
+printf '%s\\n' "\$1" >>"$TMP/notify.log"
+NOTIFY
+chmod 755 "$TMP/notify.sh"
+
 cat >"$TMP/config.toml" <<CFG
 listen = "$ADDR"
 static_dir = "$TMP/static"
@@ -101,6 +108,12 @@ ping_interval_secs = 30
 # The cap counts ALL of ktulu's tmux sessions on the real server (many already
 # exist), so the default of 5 would refuse new e2e sessions.
 max_sessions_per_user = 100
+
+# The production shape: the sandboxed helper hands the command to the user's
+# systemd manager. Zero quiet period so every open is announced.
+[notify]
+command = ["/usr/bin/systemd-run", "--user", "--collect", "--quiet", "$TMP/notify.sh", "{message}"]
+quiet_secs = 0
 
 [[users]]
 email = "e2e@example.com"
@@ -166,7 +179,7 @@ start_unit_or_die
 pass "unit started and listening on $ADDR"
 
 echo "--- cargo e2e tests"
-E2E_KEY_PEM="$KEY" E2E_URL="$ADDR" E2E_UNIT="$UNIT" \
+E2E_KEY_PEM="$KEY" E2E_URL="$ADDR" E2E_UNIT="$UNIT" E2E_NOTIFY_LOG="$TMP/notify.log" \
   cargo test --release --test e2e_privsep -- --ignored --test-threads=1
 if [ $? -eq 0 ]; then pass "cargo e2e tests"; else fail "cargo e2e tests"; fi
 

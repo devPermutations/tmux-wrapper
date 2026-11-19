@@ -22,9 +22,10 @@ impl PtyMaster {
     /// be called within a tokio runtime.
     pub fn from_fd(fd: OwnedFd) -> io::Result<PtyMaster> {
         set_nonblocking(&fd)?;
-        Ok(PtyMaster {
-            async_fd: AsyncFd::new(fd)?,
-        })
+        // SAFETY: the `OwnedFd` is a valid open descriptor that the `AsyncFd`
+        // now owns; nothing else closes or replaces it while it is registered.
+        let async_fd = unsafe { AsyncFd::register(fd) }?;
+        Ok(PtyMaster { async_fd })
     }
 
     /// Set the terminal size via TIOCSWINSZ on the master.

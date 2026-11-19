@@ -307,6 +307,147 @@ async fn bad_tokens_rejected_at_front() {
     assert_eq!(get(mint(EMAIL, now() - 300)).await, 401);
 }
 
+/// A valid token does not help a request another site's page makes: every
+/// authenticated endpoint refuses a foreign `Origin`, and nothing is killed.
+#[tokio::test]
+#[ignore]
+async fn cross_site_requests_are_refused_even_with_a_valid_token() {
+    ensure_session_a().await;
+    let http = reqwest::Client::new();
+    let tok = good_token();
+    let host = env("E2E_URL");
+
+    for origin in [
+        "https://evil.example",
+        "null",
+        &format!("http://{host}.evil.example"),
+    ] {
+        let del = http
+            .delete(http_url("/api/sessions/e2e-a"))
+            .header("Cf-Access-Jwt-Assertion", &tok)
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(del.status(), 403, "DELETE with Origin {origin}");
+        let list = http
+            .get(http_url("/api/sessions"))
+            .header("Cf-Access-Jwt-Assertion", &tok)
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), 403, "GET with Origin {origin}");
+
+        let url = format!("ws://{host}/ws?session=e2e-a");
+        let mut req = url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("Cf-Access-Jwt-Assertion", tok.parse().unwrap());
+        req.headers_mut().insert("Origin", origin.parse().unwrap());
+        assert!(
+            tokio_tungstenite::connect_async(req).await.is_err(),
+            "WebSocket upgrade with Origin {origin} was accepted"
+        );
+    }
+
+    // The site's own origin still works, and e2e-a survived all of the above.
+    let own = format!("http://{host}");
+    let list = http
+        .get(http_url("/api/sessions"))
+        .header("Cf-Access-Jwt-Assertion", &tok)
+        .header("Origin", &own)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let body: serde_json::Value = list.json().await.unwrap();
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "e2e-a"),
+        "e2e-a was killed by a cross-site request: {body}"
+    );
+    let del = http
+        .delete(http_url("/api/sessions/e2e-a"))
+        .header("Cf-Access-Jwt-Assertion", &tok)
+        .header("Origin", &own)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 200);
+}
+
+/// Scripts on the page may connect to this host only.
+#[tokio::test]
+#[ignore]
+async fn content_security_policy_names_only_this_host() {
+    let host = env("E2E_URL");
+    let resp = reqwest::Client::new()
+        .get(http_url("/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .expect("no CSP header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        csp.contains(&format!("connect-src 'self' ws://{host} wss://{host};")),
+        "{csp}"
+    );
+    assert!(csp.contains("script-src 'self';"), "{csp}");
+}
+
+/// Opening a terminal runs the `[notify]` command through the user's systemd
+/// manager, from inside the production sandbox, with the edge's client
+/// address in the message.
+#[tokio::test]
+#[ignore]
+async fn opening_a_terminal_sends_the_login_notification() {
+    let log = env("E2E_NOTIFY_LOG");
+    let before = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+
+    let url = format!("ws://{}/ws?session=e2e-a", env("E2E_URL"));
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cf-Access-Jwt-Assertion", good_token().parse().unwrap());
+    req.headers_mut()
+        .insert("Cf-Connecting-Ip", "203.0.113.77".parse().unwrap());
+    req.headers_mut()
+        .insert("Cf-Ipcountry", "CA".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("websocket connect");
+    send_line(&mut ws, "echo note-$((5+6))\r").await;
+    expect_output(&mut ws, "note-11", 5).await;
+    let _ = ws.close(None).await;
+
+    let want = "Web terminal opened: tmux session 'e2e-a' from 203.0.113.77 (CA)";
+    let found = timeout(Duration::from_secs(10), async {
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.lines().skip(before).any(|l| l == want) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "no notification within 10 s; log: {:?}",
+        std::fs::read_to_string(&log)
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn socket_closes_4001_when_token_expires() {

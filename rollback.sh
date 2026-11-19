@@ -43,7 +43,7 @@ systemctl is-active --quiet tmuxwrapper && was_active=1
 
 echo "==> Restoring binary, static files and unit from $BACKUP"
 sudo install -m 0755 "$BACKUP/tmuxwrapper" "$DEST/tmuxwrapper"
-sudo rsync -a --delete "$BACKUP/static/" "$DEST/static/"
+sudo rsync -a --delete --chown=root:root --chmod=D755,F644 "$BACKUP/static/" "$DEST/static/"
 sudo install -m 0644 "$BACKUP/tmuxwrapper.service" "$UNIT"
 sudo systemctl daemon-reload
 

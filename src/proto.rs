@@ -17,9 +17,19 @@ use tokio::io::unix::AsyncFd;
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Open { token: String, session: String },
-    List { token: String },
-    Kill { token: String, name: String },
+    Open {
+        token: String,
+        session: String,
+        #[serde(default)]
+        client: ClientInfo,
+    },
+    List {
+        token: String,
+    },
+    Kill {
+        token: String,
+        name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -32,6 +42,15 @@ pub enum Response {
     Refused { reason: String },
     Unauthorized,
     BadRequest,
+}
+
+/// Where the edge says a request came from (address and country code), as
+/// far as the front could read it. Informational: used for logs and the
+/// login notification, never for authorization.
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone)]
+pub struct ClientInfo {
+    pub ip: Option<String>,
+    pub country: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -175,7 +194,9 @@ impl AsyncSeqpacket {
     pub fn new(fd: OwnedFd) -> io::Result<Self> {
         let flags = OFlag::from_bits_retain(fcntl(&fd, FcntlArg::F_GETFL)?);
         fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-        Ok(Self(AsyncFd::new(fd)?))
+        // SAFETY: the `OwnedFd` is a valid open descriptor that the `AsyncFd`
+        // now owns; nothing else closes or replaces it while it is registered.
+        Ok(Self(unsafe { AsyncFd::register(fd) }?))
     }
 
     pub async fn send<T: Serialize>(&self, msg: &T, fd: Option<BorrowedFd<'_>>) -> io::Result<()> {
@@ -211,6 +232,7 @@ mod tests {
             Request::Open {
                 token: "t".into(),
                 session: "main".into(),
+                client: ClientInfo::default(),
             },
             Request::List { token: "t".into() },
             Request::Kill {
@@ -258,7 +280,23 @@ mod tests {
             r,
             Request::Open {
                 token: "t".into(),
-                session: "main".into()
+                session: "main".into(),
+                client: ClientInfo::default(),
+            }
+        );
+        let r: Request = serde_json::from_str(
+            r#"{"op":"open","token":"t","session":"main","client":{"ip":"203.0.113.7","country":"CA"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            Request::Open {
+                token: "t".into(),
+                session: "main".into(),
+                client: ClientInfo {
+                    ip: Some("203.0.113.7".into()),
+                    country: Some("CA".into()),
+                },
             }
         );
         assert_eq!(

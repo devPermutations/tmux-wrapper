@@ -19,7 +19,25 @@ pub struct Config {
     pub static_dir: String,
     pub cloudflare: CloudflareConfig,
     pub terminal: TerminalConfig,
+    /// Optional login notification (see `notify.rs`).
+    #[serde(default)]
+    pub notify: Option<NotifyConfig>,
     pub users: Vec<UserConfig>,
+}
+
+fn default_notify_quiet_secs() -> u64 {
+    12 * 60 * 60
+}
+
+/// `[notify]`: a command each user's helper runs (as that user) when a
+/// terminal is opened from an address not seen for `quiet_secs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyConfig {
+    /// Program (absolute path) and arguments; no shell. `{message}` in an
+    /// argument is replaced by a one-line description of the login.
+    pub command: Vec<String>,
+    #[serde(default = "default_notify_quiet_secs")]
+    pub quiet_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +157,15 @@ impl Config {
             if !ok {
                 return Err(format!(
                     "cloudflare.jwks_url '{url}' must be https:// or loopback http://"
+                ));
+            }
+        }
+
+        if let Some(notify) = &self.notify {
+            let program = notify.command.first().map(String::as_str).unwrap_or("");
+            if !program.starts_with('/') {
+                return Err(format!(
+                    "notify.command must start with an absolute program path, got '{program}'"
                 ));
             }
         }
@@ -426,6 +453,30 @@ tmux_session = "main"
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("jwks_url"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn notify_is_optional_and_defaults_to_a_twelve_hour_quiet_period() {
+        assert!(Config::from_toml_str(VALID).unwrap().notify.is_none());
+        let toml = VALID.replace(
+            "[[users]]",
+            "[notify]\ncommand = [\"/usr/bin/true\", \"{message}\"]\n\n[[users]]",
+        );
+        let notify = Config::from_toml_str(&toml).unwrap().notify.unwrap();
+        assert_eq!(notify.command, vec!["/usr/bin/true", "{message}"]);
+        assert_eq!(notify.quiet_secs, 43200);
+    }
+
+    #[test]
+    fn notify_command_must_be_an_absolute_program() {
+        for command in ["[]", "[\"comm\", \"send\"]", "[\"./notify.sh\"]"] {
+            let toml = VALID.replace(
+                "[[users]]",
+                &format!("[notify]\ncommand = {command}\n\n[[users]]"),
+            );
+            let err = Config::from_toml_str(&toml).unwrap_err().to_string();
+            assert!(err.contains("notify.command"), "{command}: {err}");
         }
     }
 

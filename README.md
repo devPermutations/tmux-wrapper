@@ -145,7 +145,30 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
 ```
+
+Around the token check:
+
+- **Cross-site requests are refused.** The Access cookie is `SameSite=None`, so the front rejects (403) any request to `/ws` or `/api/*` whose `Origin` is not the site itself, valid token or not.
+- **The page can only talk to its own host.** The Content-Security-Policy allows scripts from the site only and names the request's host as the one WebSocket endpoint.
+- **Static files belong to root.** `deploy.sh` installs them `root:root`, read-only to everyone else, so only a deploy can change what runs in the logged-in browser.
+- **Sessions end with the Access session.** A stolen cookie is good until the token's `exp`; the wrapper cannot revoke it. Keep the Access application's session duration short.
+
+### Login notification
+
+A web terminal is as good as a login, so the wrapper can tell you when one opens. Add to `config.toml`:
+
+```toml
+[notify]
+command = ["/usr/bin/systemd-run", "--user", "--collect", "--quiet", "/usr/local/bin/notify-me", "{message}"]
+quiet_secs = 43200   # default: 12 hours
+```
+
+The user's helper runs the command (an argv, no shell) when a terminal is opened from an address it has not seen for `quiet_secs` (IPv6 addresses are grouped by /64). `{message}` becomes a line such as `Web terminal opened: tmux session 'main' from 203.0.113.7 (CA)`; `TMUXWRAPPER_SESSION`, `TMUXWRAPPER_CLIENT_IP` and `TMUXWRAPPER_CLIENT_COUNTRY` are set as well. The address and country come from Cloudflare's `Cf-Connecting-Ip` and `Cf-Ipcountry` headers and are also written to the log. The command runs inside the service sandbox (read-only `/home`), which is why the example hands it to the user's systemd manager. A failing command is logged and never blocks the terminal.
 
 ## Status
 
