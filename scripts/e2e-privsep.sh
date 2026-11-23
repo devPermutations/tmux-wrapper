@@ -7,17 +7,21 @@
 #
 #   scripts/e2e-privsep.sh
 #
-# Output is teed to docs/plans/2026-10-03-privilege-separation-e2e.log.
+# Output is teed to $TMUXWRAPPER_E2E_LOG (default: $TMPDIR/tmuxwrapper-e2e.log).
+# The run uses $TMUXWRAPPER_E2E_USER (default: the current user) as the unix user.
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
-LOG="$REPO/docs/plans/2026-10-03-privilege-separation-e2e.log"
+LOG="${TMUXWRAPPER_E2E_LOG:-${TMPDIR:-/tmp}/tmuxwrapper-e2e.log}"
 mkdir -p "$(dirname "$LOG")"
 : >"$LOG"
 exec > >(tee -a "$LOG") 2>&1
 
 UNIT=tmuxwrapper-e2e
+# The unix user the test terminals run as: whoever runs this script, unless
+# TMUXWRAPPER_E2E_USER names another.
+E2E_USER="${TMUXWRAPPER_E2E_USER:-$(id -un)}"
 ADDR=127.0.0.1:7682
 JWKS_PORT=8799
 TMP=""
@@ -59,7 +63,7 @@ mkdir -p "$TMP/jwks" "$TMP/key"
 chmod 755 "$TMP/jwks"
 chmod 700 "$TMP/key"
 
-# The unit's root has no CAP_DAC_OVERRIDE and /home/ktulu is 0750, so everything
+# The unit's root has no CAP_DAC_OVERRIDE and the user's home is usually 0750, so everything
 # it reads lives in the world-readable temp dir.
 cp target/release/tmuxwrapper "$TMP/tmuxwrapper" && chmod 755 "$TMP/tmuxwrapper"
 cp -r static "$TMP/static" && chmod -R a+rX "$TMP/static"
@@ -105,7 +109,7 @@ jwks_refresh_secs = 3600
 
 [terminal]
 ping_interval_secs = 30
-# The cap counts ALL of ktulu's tmux sessions on the real server (many already
+# The cap counts ALL of the user's tmux sessions on the real server (many may
 # exist), so the default of 5 would refuse new e2e sessions.
 max_sessions_per_user = 100
 
@@ -117,7 +121,7 @@ quiet_secs = 0
 
 [[users]]
 email = "e2e@example.com"
-unix_user = "ktulu"
+unix_user = "$E2E_USER"
 tmux_session = "e2e-main"
 CFG
 chmod 644 "$TMP/config.toml"
@@ -179,7 +183,7 @@ start_unit_or_die
 pass "unit started and listening on $ADDR"
 
 echo "--- cargo e2e tests"
-E2E_KEY_PEM="$KEY" E2E_URL="$ADDR" E2E_UNIT="$UNIT" E2E_NOTIFY_LOG="$TMP/notify.log" \
+E2E_KEY_PEM="$KEY" E2E_URL="$ADDR" E2E_UNIT="$UNIT" E2E_NOTIFY_LOG="$TMP/notify.log" E2E_USER="$E2E_USER" \
   cargo test --release --test e2e_privsep -- --ignored --test-threads=1
 if [ $? -eq 0 ]; then pass "cargo e2e tests"; else fail "cargo e2e tests"; fi
 

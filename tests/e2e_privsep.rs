@@ -191,6 +191,15 @@ fn helper_pid(main: u32) -> u32 {
         .expect("no helper child of the main process")
 }
 
+/// The unix user the terminals run as: `E2E_USER` (set by
+/// scripts/e2e-privsep.sh), else whoever runs the tests.
+fn e2e_user() -> String {
+    std::env::var("E2E_USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| cmd_out("id", &["-un"]))
+}
+
 fn id_of(flag: &str, user: &str) -> u32 {
     cmd_out("id", &[flag, user]).parse().expect("id output")
 }
@@ -214,8 +223,9 @@ async fn process_model() {
     assert_no_caps(main, "front");
 
     let helper = helper_pid(main);
-    let gid = id_of("-g", "ktulu");
-    assert_ids(helper, "Uid", id_of("-u", "ktulu"), "helper");
+    let user = e2e_user();
+    let gid = id_of("-g", &user);
+    assert_ids(helper, "Uid", id_of("-u", &user), "helper");
     assert_ids(helper, "Gid", gid, "helper");
     assert_eq!(
         status_field(helper, "Groups").as_deref(),

@@ -164,11 +164,11 @@ A web terminal is as good as a login, so the wrapper can tell you when one opens
 
 ```toml
 [notify]
-command = ["/usr/bin/systemd-run", "--user", "--collect", "--quiet", "/usr/local/bin/notify-me", "{message}"]
+command = ["/usr/bin/systemd-run", "--user", "--collect", "--quiet", "--setenv=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin", "/usr/local/bin/notify-me", "{message}"]
 quiet_secs = 43200   # default: 12 hours
 ```
 
-The user's helper runs the command (an argv, no shell) when a terminal is opened from an address it has not seen for `quiet_secs` (IPv6 addresses are grouped by /64). `{message}` becomes a line such as `Web terminal opened: tmux session 'main' from 203.0.113.7 (CA)`; `TMUXWRAPPER_SESSION`, `TMUXWRAPPER_CLIENT_IP` and `TMUXWRAPPER_CLIENT_COUNTRY` are set as well. The address and country come from Cloudflare's `Cf-Connecting-Ip` and `Cf-Ipcountry` headers and are also written to the log. The command runs inside the service sandbox (read-only `/home`), which is why the example hands it to the user's systemd manager. A failing command is logged and never blocks the terminal.
+The user's helper runs the command (an argv, no shell) when a terminal is opened from an address it has not seen for `quiet_secs` (IPv6 addresses are grouped by /64). `{message}` becomes a line such as `Web terminal opened: tmux session 'main' from 203.0.113.7 (CA)`; `TMUXWRAPPER_SESSION`, `TMUXWRAPPER_CLIENT_IP` and `TMUXWRAPPER_CLIENT_COUNTRY` are set as well. The address and country come from Cloudflare's `Cf-Connecting-Ip` and `Cf-Ipcountry` headers and are also written to the log. The command runs inside the service sandbox (read-only `/home`), which is why the example hands it to the user's systemd manager. That manager starts commands with a minimal `PATH`: if your notifier calls other programs from `~/.local/bin` or `~/.cargo/bin`, pass a `PATH` with `--setenv` as in the example, or it fails with "No such file or directory". A failing command is logged and never blocks the terminal.
 
 ## Status
 
